@@ -23,58 +23,30 @@ const DEFAULT_SEED: u64 = 42;
 
 #[derive(Debug, Clone, Copy)]
 struct SimulationConfig {
-    shortage_effects: bool,
-    live_prices: bool,
+    name: &'static str,
     stale_prices: bool,
-    route_familiarity: bool,
-    ruin_aware: bool,
     seed: u64,
-    quiet: bool,
+    verbose: bool,
 }
 
 impl SimulationConfig {
-    fn baseline(seed: u64) -> Self {
-        Self {
-            shortage_effects: false,
-            live_prices: false,
-            stale_prices: false,
-            route_familiarity: false,
-            ruin_aware: false,
-            seed,
-            quiet: false,
-        }
-    }
-
-    fn named(name: &str, seed: u64, quiet: bool) -> Self {
-        let mut config = Self::baseline(seed);
-        config.quiet = quiet;
+    fn named(name: &str, seed: u64, verbose: bool) -> Self {
         match name {
-            "baseline" => {}
-            "shortage-effects" => config.shortage_effects = true,
-            "live-prices" => config.live_prices = true,
-            "stale-prices" => config.stale_prices = true,
-            "route-familiarity" => config.route_familiarity = true,
-            "ruin-aware" => config.ruin_aware = true,
+            "baseline" => Self {
+                name: "baseline",
+                stale_prices: false,
+                seed,
+                verbose,
+            },
+            "stale-prices" => Self {
+                name: "stale-prices",
+                stale_prices: true,
+                seed,
+                verbose,
+            },
             other => panic!(
-                "unknown experiment {other:?}; try: baseline, shortage-effects, live-prices, stale-prices, route-familiarity, ruin-aware, compare"
+                "unknown experiment {other:?}; try: baseline, stale-prices, compare"
             ),
-        }
-        config
-    }
-
-    fn label(&self) -> &'static str {
-        if self.shortage_effects {
-            "shortage-effects"
-        } else if self.live_prices {
-            "live-prices"
-        } else if self.stale_prices {
-            "stale-prices"
-        } else if self.route_familiarity {
-            "route-familiarity"
-        } else if self.ruin_aware {
-            "ruin-aware"
-        } else {
-            "baseline"
         }
     }
 }
@@ -98,9 +70,6 @@ struct Settlement {
     consumption: HashMap<Good, f64>,
 
     money: f64,
-
-    /// Scales next month's production after shortages (1.0 = full output).
-    production_scale: HashMap<Good, f64>,
 }
 
 #[derive(Debug, Clone)]
@@ -137,10 +106,8 @@ struct Trader {
     /// CRRA coefficient γ — higher values reject risky trades more strongly.
     risk_aversion: f64,
 
-    /// Last observed prices for imperfect-information experiments.
+    /// Last observed prices at visited markets (stale-prices experiment only).
     known_prices: HashMap<(SettlementId, Good), f64>,
-    /// Route experience for hazard reduction when route familiarity is enabled.
-    route_familiarity: HashMap<RouteId, u32>,
 }
 
 #[derive(Debug, Clone)]
@@ -260,51 +227,18 @@ impl World {
     fn produce(&mut self) {
         for settlement in &mut self.settlements {
             for (&good, &amount) in &settlement.production {
-                let scale = production_scale_for(settlement, good, &self.config);
-                let produced = amount * scale;
-                *settlement.stockpiles.entry(good).or_insert(0.0) += produced;
+                *settlement.stockpiles.entry(good).or_insert(0.0) += amount;
 
                 self.events.push(Event::Produced {
                     settlement: settlement.id,
                     good,
-                    amount: produced,
+                    amount,
                 });
             }
         }
     }
 
-    fn apply_shortage_effects(
-        &mut self,
-        settlement_id: SettlementId,
-        good: Good,
-        needed: f64,
-        consumed: f64,
-    ) {
-        if !self.config.shortage_effects || needed <= 0.0 {
-            return;
-        }
-
-        let fulfillment = (consumed / needed).clamp(0.0, 1.0);
-        let settlement = &mut self.settlements[settlement_id];
-
-        match good {
-            Good::Food => {
-                for produced_good in settlement.production.keys().copied().collect::<Vec<_>>() {
-                    settlement
-                        .production_scale
-                        .insert(produced_good, fulfillment);
-                }
-            }
-            Good::Ore if settlement_id == 2 => {
-                settlement.production_scale.insert(Good::Tools, fulfillment);
-            }
-            _ => {}
-        }
-    }
-
     fn consume(&mut self) {
-        let mut shortage_updates = Vec::new();
-
         for settlement in &mut self.settlements {
             for (&good, &needed) in &settlement.consumption {
                 let available = settlement.stockpiles.entry(good).or_insert(0.0);
@@ -324,13 +258,8 @@ impl World {
                         good,
                         unmet: needed - consumed,
                     });
-                    shortage_updates.push((settlement.id, good, needed, consumed));
                 }
             }
-        }
-
-        for (settlement_id, good, needed, consumed) in shortage_updates {
-            self.apply_shortage_effects(settlement_id, good, needed, consumed);
         }
     }
 
@@ -373,24 +302,17 @@ impl World {
                 }
             }
         }
-
-        if self.config.stale_prices {
-            self.refresh_trader_price_knowledge();
-        }
     }
 
-    fn refresh_trader_price_knowledge(&mut self) {
-        for trader in &mut self.traders {
-            for settlement_id in 0..self.settlements.len() {
-                if settlement_id == trader.location || settlement_id == trader.home_base {
-                    for &good in &[Good::Food, Good::Ore, Good::Tools] {
-                        trader.known_prices.insert(
-                            (settlement_id, good),
-                            self.settlements[settlement_id].prices[&good],
-                        );
-                    }
-                }
-            }
+    fn sync_trader_prices_at(&mut self, trader_id: TraderId, settlement_id: SettlementId) {
+        if !self.config.stale_prices {
+            return;
+        }
+        for &good in &[Good::Food, Good::Ore, Good::Tools] {
+            self.traders[trader_id].known_prices.insert(
+                (settlement_id, good),
+                self.settlements[settlement_id].prices[&good],
+            );
         }
     }
 
@@ -485,11 +407,8 @@ impl World {
                 self.routes[opportunity.route].used_capacity_this_month += quantity;
 
                 let route = &self.routes[opportunity.route];
-                let effective_rate = if self.config.route_familiarity {
-                    effective_monthly_incident_rate_for_trader(route, trader_id, self)
-                } else {
-                    effective_monthly_incident_rate(route, self.traders[trader_id].location)
-                };
+                let effective_rate =
+                    effective_monthly_incident_rate(route, self.traders[trader_id].location);
 
                 let shipment = Shipment {
                     trader: trader_id,
@@ -517,10 +436,6 @@ impl World {
                     seller: seller_id,
                     buyer: buyer_id,
                 });
-
-                if self.config.live_prices {
-                    self.update_prices();
-                }
             }
         }
     }
@@ -543,12 +458,7 @@ impl World {
                 for &good in &[Good::Food, Good::Ore, Good::Tools] {
                     let seller_price = self.trader_price(trader_id, seller_id, good);
                     let buyer_price = self.trader_price(trader_id, buyer_id, good);
-
-                    let p_eff = if self.config.route_familiarity {
-                        effective_monthly_incident_rate_for_trader(route, trader_id, self)
-                    } else {
-                        effective_monthly_incident_rate(route, trader.location)
-                    };
+                    let p_eff = effective_monthly_incident_rate(route, trader.location);
 
                     let ev_per_unit = expected_profit_per_unit(
                         seller_price,
@@ -571,15 +481,6 @@ impl World {
 
                     if suggested_quantity < 1.0 {
                         continue;
-                    }
-
-                    if self.config.ruin_aware {
-                        let purchase = suggested_quantity * seller_price;
-                        let transport = suggested_quantity * route.cost_per_unit;
-                        let w_bad = trader.money - purchase - transport;
-                        if w_bad <= 0.0 {
-                            continue;
-                        }
                     }
 
                     let score = trade_utility_score(
@@ -619,8 +520,9 @@ impl World {
 
     fn advance_shipments(&mut self) {
         let mut remaining_shipments = Vec::new();
+        let pending: Vec<Shipment> = self.shipments.drain(..).collect();
 
-        for mut shipment in self.shipments.drain(..) {
+        for mut shipment in pending {
             if shipment.months_remaining > 0 {
                 if let Some(lost) = apply_monthly_cargo_risk(
                     &mut shipment.quantity,
@@ -667,23 +569,7 @@ impl World {
             self.settlements[route.b].money += transport_half;
 
             self.traders[shipment.trader].location = shipment.buyer;
-
-            if self.config.route_familiarity {
-                *self.traders[shipment.trader]
-                    .route_familiarity
-                    .entry(shipment.route)
-                    .or_insert(0) += 1;
-            }
-
-            if self.config.stale_prices {
-                let trader_id = shipment.trader;
-                let buyer = shipment.buyer;
-                for &good in &[Good::Food, Good::Ore, Good::Tools] {
-                    self.traders[trader_id]
-                        .known_prices
-                        .insert((buyer, good), self.settlements[buyer].prices[&good]);
-                }
-            }
+            self.sync_trader_prices_at(shipment.trader, shipment.buyer);
 
             self.events.push(Event::ShipmentArrived {
                 trader: shipment.trader,
@@ -718,28 +604,6 @@ fn effective_monthly_incident_rate(route: &Route, trader_location: SettlementId)
     } else {
         base
     }
-}
-
-fn effective_monthly_incident_rate_for_trader(
-    route: &Route,
-    trader_id: TraderId,
-    world: &World,
-) -> f64 {
-    let base = route.monthly_incident_rate;
-    let trips = world.traders[trader_id]
-        .route_familiarity
-        .get(&route.id)
-        .copied()
-        .unwrap_or(0);
-    let familiarity = 1.0 - (trips as f64 * 0.15).min(0.5);
-    base * familiarity
-}
-
-fn production_scale_for(settlement: &Settlement, good: Good, config: &SimulationConfig) -> f64 {
-    if !config.shortage_effects {
-        return 1.0;
-    }
-    *settlement.production_scale.get(&good).unwrap_or(&1.0)
 }
 
 /// E[fraction delivered] with at most one incident per month and U[0,1] loss fraction.
@@ -1242,70 +1106,47 @@ fn run_simulation(config: SimulationConfig) -> SimulationSummary {
     let mut months_with_trade = 0;
     let mut last_month_with_trade = 0;
 
-    for _ in 0..SIMULATION_MONTHS {
-        world.tick_month();
-        let month_events: Vec<Event> = world.events.drain(..).collect();
-        if month_events
-            .iter()
-            .any(|e| matches!(e, Event::ShipmentCreated { .. }))
-        {
-            months_with_trade += 1;
-            last_month_with_trade = world.month;
-        }
-        all_events.extend(month_events);
-    }
-
-    SimulationSummary::from_events(
-        config.label(),
-        &all_events,
-        &world,
-        months_with_trade,
-        last_month_with_trade,
-    )
-}
-
-fn run_simulation_verbose(config: SimulationConfig) -> SimulationSummary {
-    let mut world = create_demo_world(config);
-    let mut all_events = Vec::new();
-    let mut months_with_trade = 0;
-    let mut last_month_with_trade = 0;
-
-    println!(
-        "{}",
-        format!("Experiment: {}", config.label()).bold().cyan()
-    );
-    println!("{}", "Initial state:".bold().cyan());
-    print_settlements(&world.settlements);
-    println!();
-    print_traders(&world.traders, &world.settlements);
-    println!();
-
-    for _ in 0..SIMULATION_MONTHS {
-        world.tick_month();
-
+    if config.verbose {
         println!(
-            "\n{}",
-            format!("═══ Month {} ═══", world.month).bold().cyan()
+            "{}",
+            format!("Experiment: {}", config.name).bold().cyan()
         );
-
-        let month_events: Vec<Event> = world.events.drain(..).collect();
-        if month_events
-            .iter()
-            .any(|e| matches!(e, Event::ShipmentCreated { .. }))
-        {
-            months_with_trade += 1;
-            last_month_with_trade = world.month;
-        }
-        print_events(&month_events, &world);
-        all_events.extend(month_events);
-        println!();
+        println!("{}", "Initial state:".bold().cyan());
         print_settlements(&world.settlements);
         println!();
         print_traders(&world.traders, &world.settlements);
+        println!();
+    }
+
+    for _ in 0..SIMULATION_MONTHS {
+        world.tick_month();
+
+        let month_events: Vec<Event> = world.events.drain(..).collect();
+        if month_events
+            .iter()
+            .any(|e| matches!(e, Event::ShipmentCreated { .. }))
+        {
+            months_with_trade += 1;
+            last_month_with_trade = world.month;
+        }
+
+        if config.verbose {
+            println!(
+                "\n{}",
+                format!("═══ Month {} ═══", world.month).bold().cyan()
+            );
+            print_events(&month_events, &world);
+            println!();
+            print_settlements(&world.settlements);
+            println!();
+            print_traders(&world.traders, &world.settlements);
+        }
+
+        all_events.extend(month_events);
     }
 
     SimulationSummary::from_events(
-        config.label(),
+        config.name,
         &all_events,
         &world,
         months_with_trade,
@@ -1387,8 +1228,9 @@ fn parse_args() -> (String, u64, bool) {
             "--help" | "-h" => {
                 println!(
                     "Usage: mundios [--experiment NAME] [--seed N] [--quiet] [--compare]\n\
-                     Experiments: baseline, shortage-effects, live-prices, stale-prices, \
-                     route-familiarity, ruin-aware, compare"
+                     Experiments: baseline, stale-prices, compare\n\
+                     (Removed no-op/harmful toggles: shortage-effects, live-prices, \
+                     route-familiarity, ruin-aware — see PR discussion.)"
                 );
                 std::process::exit(0);
             }
@@ -1405,28 +1247,18 @@ fn main() {
     let (experiment, seed, quiet) = parse_args();
 
     if experiment == "compare" {
-        let names = [
-            "baseline",
-            "shortage-effects",
-            "live-prices",
-            "stale-prices",
-            "route-familiarity",
-            "ruin-aware",
-        ];
+        let names = ["baseline", "stale-prices"];
         let summaries: Vec<SimulationSummary> = names
             .iter()
-            .map(|name| {
-                let config = SimulationConfig::named(name, seed, true);
-                run_simulation(config)
-            })
+            .map(|name| run_simulation(SimulationConfig::named(name, seed, false)))
             .collect();
         print_comparison_table(&summaries);
         return;
     }
 
-    let config = SimulationConfig::named(&experiment, seed, quiet);
-    if quiet {
-        let summary = run_simulation(config);
+    let config = SimulationConfig::named(&experiment, seed, !quiet);
+    let summary = run_simulation(config);
+    if !config.verbose {
         println!(
             "{}: shipments={} arrived={} shortages={} trade_months={}/{} last_trade={} trader_spread={:.1} min_settlement=${:.1}",
             summary.experiment,
@@ -1439,8 +1271,6 @@ fn main() {
             summary.trader_money_spread,
             summary.min_settlement_money,
         );
-    } else {
-        run_simulation_verbose(config);
     }
 }
 
@@ -1455,7 +1285,6 @@ fn create_demo_world(config: SimulationConfig) -> World {
         production: HashMap::from([(Good::Food, 150.0)]),
         consumption: HashMap::from([(Good::Food, 80.0), (Good::Tools, 10.0)]),
         money: 1000.0,
-        production_scale: HashMap::new(),
     };
 
     let mining_world = Settlement {
@@ -1466,7 +1295,6 @@ fn create_demo_world(config: SimulationConfig) -> World {
         production: HashMap::from([(Good::Ore, 120.0)]),
         consumption: HashMap::from([(Good::Food, 120.0), (Good::Tools, 15.0)]),
         money: 1000.0,
-        production_scale: HashMap::new(),
     };
 
     let factory_world = Settlement {
@@ -1477,7 +1305,6 @@ fn create_demo_world(config: SimulationConfig) -> World {
         production: HashMap::from([(Good::Tools, 60.0)]),
         consumption: HashMap::from([(Good::Food, 140.0), (Good::Ore, 90.0)]),
         money: 1000.0,
-        production_scale: HashMap::new(),
     };
 
     let routes = vec![
@@ -1523,7 +1350,6 @@ fn create_demo_world(config: SimulationConfig) -> World {
             trade_capacity: 80.0,
             risk_aversion: 2.0,
             known_prices: HashMap::new(),
-            route_familiarity: HashMap::new(),
         },
         Trader {
             id: 1,
@@ -1534,7 +1360,6 @@ fn create_demo_world(config: SimulationConfig) -> World {
             trade_capacity: 80.0,
             risk_aversion: 0.5,
             known_prices: HashMap::new(),
-            route_familiarity: HashMap::new(),
         },
     ];
 
@@ -1551,7 +1376,14 @@ fn create_demo_world(config: SimulationConfig) -> World {
         events: Vec::new(),
         rng: StdRng::seed_from_u64(config.seed),
     };
-    world.refresh_trader_price_knowledge();
+    if config.stale_prices {
+        for trader_id in 0..world.traders.len() {
+            let location = world.traders[trader_id].location;
+            let home_base = world.traders[trader_id].home_base;
+            world.sync_trader_prices_at(trader_id, location);
+            world.sync_trader_prices_at(trader_id, home_base);
+        }
+    }
     world.expected_total_money = total_money(&world);
     world
 }
