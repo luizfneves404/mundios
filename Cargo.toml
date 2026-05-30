@@ -1,0 +1,9 @@
+[package]
+name = "mundios"
+version = "0.1.0"
+edition = "2024"
+
+[dependencies]
+colored = "3"
+comfy-table = "7"
+rand = "0.8"
