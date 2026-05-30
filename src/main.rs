@@ -34,6 +34,12 @@ const PROSPERITY_THRESHOLD: f64 = 2500.0;
 /// How quickly production recovers toward full output after shortages ease.
 const PRODUCTION_RECOVERY_RATE: f64 = 0.2;
 
+/// Target stockpile (in months of consumption) that triggers import demand.
+const STOCK_TARGET_MONTHS: f64 = 1.5;
+/// Minimum per-unit spread (sell - buy - transport) a trader wants to see.
+const MIN_HEURISTIC_SPREAD: f64 = 0.5;
+/// How wrong one-hop market rumors can be (± fraction).
+const RUMOR_NOISE: f64 = 0.1;
 const DEFAULT_MONTHS: u32 = 12;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
@@ -91,8 +97,11 @@ struct Trader {
     /// Monthly pool of trade activity; each shipment uses at least 1 unit.
     trade_capacity: f64,
 
-    /// CRRA coefficient γ — higher values reject risky trades more strongly.
-    risk_aversion: f64,
+    /// 0–1: willingness to run routes with cargo risk (higher = bolder).
+    risk_tolerance: f64,
+
+    /// Last observed prices; fresh at current location and home base only.
+    known_prices: HashMap<(SettlementId, Good), f64>,
 }
 
 #[derive(Debug, Clone)]
@@ -382,7 +391,7 @@ impl World {
                 let stockpile = *settlement.stockpiles.get(&good).unwrap_or(&0.0);
                 let monthly_need = *settlement.consumption.get(&good).unwrap_or(&1.0);
 
-                let target_stockpile = monthly_need * 3.0;
+                let target_stockpile = monthly_need * STOCK_TARGET_MONTHS;
 
                 let scarcity_ratio = if stockpile <= 0.01 {
                     10.0
@@ -411,6 +420,99 @@ impl World {
                 }
             }
         }
+
+        self.refresh_trader_price_knowledge();
+    }
+
+    fn route_neighbors(&self, settlement_id: SettlementId) -> Vec<SettlementId> {
+        let mut neighbors = Vec::new();
+        for route in &self.routes {
+            if route.a == settlement_id {
+                neighbors.push(route.b);
+            } else if route.b == settlement_id {
+                neighbors.push(route.a);
+            }
+        }
+        neighbors
+    }
+
+    fn rumor_price(&self, trader_id: TraderId, settlement_id: SettlementId, good: Good) -> f64 {
+        let actual = self.settlements[settlement_id].prices[&good];
+        let good_idx = match good {
+            Good::Food => 0,
+            Good::Ore => 1,
+            Good::Tools => 2,
+        };
+        let hash = (trader_id * 31 + settlement_id * 17 + good_idx * 7) as f64;
+        let noise = ((hash % 100.0) / 100.0 - 0.5) * 2.0 * RUMOR_NOISE;
+        actual * (1.0 + noise)
+    }
+
+    fn refresh_trader_price_knowledge(&mut self) {
+        for trader_id in 0..self.traders.len() {
+            let location = self.traders[trader_id].location;
+            let home_base = self.traders[trader_id].home_base;
+
+            let mut heard_from = Vec::new();
+            heard_from.push(location);
+            heard_from.push(home_base);
+            heard_from.extend(self.route_neighbors(location));
+            heard_from.extend(self.route_neighbors(home_base));
+            heard_from.sort_unstable();
+            heard_from.dedup();
+
+            for settlement_id in heard_from {
+                for &good in &[Good::Food, Good::Ore, Good::Tools] {
+                    let price = if settlement_id == location || settlement_id == home_base {
+                        self.settlements[settlement_id].prices[&good]
+                    } else {
+                        self.rumor_price(trader_id, settlement_id, good)
+                    };
+                    self.traders[trader_id]
+                        .known_prices
+                        .insert((settlement_id, good), price);
+                }
+            }
+        }
+    }
+
+    fn sync_trader_prices_at(&mut self, trader_id: TraderId, settlement_id: SettlementId) {
+        for &good in &[Good::Food, Good::Ore, Good::Tools] {
+            self.traders[trader_id].known_prices.insert(
+                (settlement_id, good),
+                self.settlements[settlement_id].prices[&good],
+            );
+        }
+    }
+
+    fn trader_price(&self, trader_id: TraderId, settlement_id: SettlementId, good: Good) -> f64 {
+        let trader = &self.traders[trader_id];
+        if settlement_id == trader.location || settlement_id == trader.home_base {
+            return self.settlements[settlement_id].prices[&good];
+        }
+
+        trader
+            .known_prices
+            .get(&(settlement_id, good))
+            .copied()
+            .unwrap_or(base_prices()[&good])
+    }
+
+    /// Stale quotes get a small directional bias: cautious traders expect worse prices abroad.
+    fn trader_perceived_price(
+        &self,
+        trader_id: TraderId,
+        settlement_id: SettlementId,
+        good: Good,
+    ) -> f64 {
+        let trader = &self.traders[trader_id];
+        let fresh = settlement_id == trader.location || settlement_id == trader.home_base;
+        let quote = self.trader_price(trader_id, settlement_id, good);
+        if fresh {
+            return quote;
+        }
+        let bias = (trader.risk_tolerance - 0.5) * 0.12;
+        quote * (1.0 + bias)
     }
 
     fn pay_trader_local_spending(&mut self) {
@@ -458,9 +560,11 @@ impl World {
 
         for trader_id in 0..trader_count {
             let mut remaining_capacity = self.traders[trader_id].trade_capacity;
+            let mut blocked: Vec<(SettlementId, SettlementId, Good)> = Vec::new();
 
             while remaining_capacity >= 1.0 {
-                let Some(opportunity) = self.best_trade_for_trader(trader_id, remaining_capacity)
+                let Some(opportunity) =
+                    self.best_trade_for_trader(trader_id, remaining_capacity, &blocked)
                 else {
                     break;
                 };
@@ -469,7 +573,7 @@ impl World {
                 let buyer_id = opportunity.buyer;
                 let good = opportunity.good;
                 let buy_price = self.settlements[seller_id].prices[&good];
-                let buyer_price = opportunity.buyer_price;
+                let actual_buyer_price = self.settlements[buyer_id].prices[&good];
 
                 let seller_stock = self.settlements[seller_id]
                     .stockpiles
@@ -478,7 +582,7 @@ impl World {
                     .unwrap_or(0.0);
                 let buyer_spending_power = settlement_purchasing_power(&self.settlements[buyer_id]);
 
-                let affordable_by_buyer = buyer_spending_power / buyer_price;
+                let affordable_by_buyer = buyer_spending_power / actual_buyer_price;
                 let route_capacity_left = self.routes[opportunity.route].capacity_per_month
                     - self.routes[opportunity.route].used_capacity_this_month;
 
@@ -491,7 +595,8 @@ impl World {
                     .floor();
 
                 if quantity < 1.0 {
-                    break;
+                    blocked.push((seller_id, buyer_id, good));
+                    continue;
                 }
 
                 *self.settlements[seller_id]
@@ -514,7 +619,7 @@ impl World {
                     buyer: buyer_id,
                     route: opportunity.route,
                     buy_price,
-                    expected_sell_price: buyer_price,
+                    expected_sell_price: opportunity.buyer_price,
                     transport_cost_per_unit: route.cost_per_unit,
                     effective_monthly_incident_rate: effective_rate,
                     months_remaining: route.travel_months,
@@ -530,10 +635,6 @@ impl World {
                     seller: seller_id,
                     buyer: buyer_id,
                 });
-
-                if quantity < 5.0 {
-                    break;
-                }
             }
         }
     }
@@ -542,6 +643,7 @@ impl World {
         &self,
         trader_id: TraderId,
         max_capacity: f64,
+        excluded: &[(SettlementId, SettlementId, Good)],
     ) -> Option<TradeOpportunity> {
         let trader = &self.traders[trader_id];
         let mut best: Option<TradeOpportunity> = None;
@@ -555,42 +657,44 @@ impl World {
                 let p_eff = effective_monthly_incident_rate(route, trader.location);
 
                 for &good in &[Good::Food, Good::Ore, Good::Tools] {
-                    let seller_price = seller.prices[&good];
-                    let buyer_price = buyer.prices[&good];
+                    if excluded
+                        .iter()
+                        .any(|&(s, b, g)| s == seller_id && b == buyer_id && g == good)
+                    {
+                        continue;
+                    }
 
-                    let ev_per_unit = expected_profit_per_unit(
-                        seller_price,
-                        buyer_price,
-                        route.cost_per_unit,
-                        p_eff,
-                        route.travel_months,
-                    );
+                    let seller_price = self.trader_perceived_price(trader_id, seller_id, good);
+                    let buyer_price = self.trader_perceived_price(trader_id, buyer_id, good);
+                    let spread = buyer_price - seller_price - route.cost_per_unit;
 
-                    if ev_per_unit <= 0.0 {
+                    let monthly_need = buyer.consumption.get(&good).copied().unwrap_or(1.0);
+                    let target_stock = monthly_need * STOCK_TARGET_MONTHS;
+                    let buyer_stock = *buyer.stockpiles.get(&good).unwrap_or(&0.0);
+                    let shortage = (target_stock - buyer_stock).max(0.0);
+
+                    if shortage < 1.0 {
+                        continue;
+                    }
+
+                    let buyer_urgency = (shortage / monthly_need).clamp(0.0, 2.0).min(1.0);
+                    let min_spread =
+                        MIN_HEURISTIC_SPREAD * (1.3 - trader.risk_tolerance - 0.3 * buyer_urgency);
+                    if spread < min_spread {
                         continue;
                     }
 
                     let stock = *seller.stockpiles.get(&good).unwrap_or(&0.0);
-                    let buyer_need = buyer.consumption.get(&good).copied().unwrap_or(1.0) * 3.0;
-                    let buyer_stock = *buyer.stockpiles.get(&good).unwrap_or(&0.0);
-                    let shortage = (buyer_need - buyer_stock).max(0.0);
-
                     let suggested_quantity = stock.min(shortage).min(max_capacity).floor();
 
                     if suggested_quantity < 1.0 {
                         continue;
                     }
 
-                    let score = trade_utility_score(
-                        trader.money,
-                        suggested_quantity,
-                        seller_price,
-                        buyer_price,
-                        route.cost_per_unit,
-                        p_eff,
-                        route.travel_months,
-                        trader.risk_aversion,
-                    );
+                    let cumulative_risk = 1.0 - (1.0 - p_eff).powi(route.travel_months as i32);
+                    let risk_discount = 1.0 - cumulative_risk * (1.0 - trader.risk_tolerance);
+                    let score =
+                        spread * suggested_quantity * risk_discount * (0.4 + 0.6 * buyer_urgency);
 
                     if score <= 0.0 {
                         continue;
@@ -682,6 +786,7 @@ impl World {
             self.traders[shipment.trader].money += scaled_profit;
 
             self.traders[shipment.trader].location = shipment.buyer;
+            self.sync_trader_prices_at(shipment.trader, shipment.buyer);
 
             self.events.push(Event::ShipmentArrived {
                 trader: shipment.trader,
@@ -716,64 +821,6 @@ fn effective_monthly_incident_rate(route: &Route, trader_location: SettlementId)
     } else {
         base
     }
-}
-
-/// E[fraction delivered] with at most one incident per month and U[0,1] loss fraction.
-fn expected_delivery_fraction(p_eff: f64, travel_months: u32) -> f64 {
-    (1.0 - 0.5 * p_eff).powi(travel_months as i32)
-}
-
-/// Risk-neutral expected profit per unit (rational benchmark).
-fn expected_profit_per_unit(
-    seller_price: f64,
-    buyer_price: f64,
-    cost_per_unit: f64,
-    p_eff: f64,
-    travel_months: u32,
-) -> f64 {
-    let frac = expected_delivery_fraction(p_eff, travel_months);
-    frac * (buyer_price - seller_price - cost_per_unit) - (1.0 - frac) * seller_price
-}
-
-fn crra_utility(wealth: f64, gamma: f64) -> f64 {
-    if wealth <= 0.0 {
-        return f64::NEG_INFINITY;
-    }
-    if (gamma - 1.0).abs() < 1e-9 {
-        wealth.ln()
-    } else {
-        wealth.powf(1.0 - gamma) / (1.0 - gamma)
-    }
-}
-
-/// Decision score: E[U(wealth after trade)] - U(current wealth).
-fn trade_utility_score(
-    current_money: f64,
-    quantity: f64,
-    buy_price: f64,
-    sell_price: f64,
-    transport_per_unit: f64,
-    p_eff: f64,
-    travel_months: u32,
-    gamma: f64,
-) -> f64 {
-    let purchase = quantity * buy_price;
-    let transport = quantity * transport_per_unit;
-    let frac_ev = expected_delivery_fraction(p_eff, travel_months);
-
-    let p_good = (1.0 - p_eff).powi(travel_months as i32);
-    let p_bad = (1.0 - p_good) * 0.5;
-    let p_ev = (1.0 - p_good - p_bad).max(0.0);
-
-    let w_good = current_money - purchase - transport + quantity * sell_price;
-    let w_bad = current_money - purchase - transport;
-    let w_ev = current_money - purchase - transport + quantity * frac_ev * sell_price;
-
-    let u_current = crra_utility(current_money, gamma);
-    p_good * crra_utility(w_good, gamma)
-        + p_ev * crra_utility(w_ev, gamma)
-        + p_bad * crra_utility(w_bad, gamma)
-        - u_current
 }
 
 fn apply_monthly_cargo_risk(
@@ -840,11 +887,14 @@ fn consumption_multiplier(settlement: &Settlement) -> f64 {
     multiplier
 }
 
-/// Cash on hand plus remaining borrowing capacity, reduced when already indebted.
+/// Cash on hand plus remaining borrowing capacity.
 fn settlement_purchasing_power(settlement: &Settlement) -> f64 {
-    let stress = debt_stress(settlement);
-    let headroom = credit_limit(settlement) * (1.0 - stress);
-    settlement.money + headroom.max(0.0)
+    let limit = credit_limit(settlement);
+    if settlement.money >= 0.0 {
+        settlement.money + limit
+    } else {
+        (limit + settlement.money).max(0.0)
+    }
 }
 
 fn percentage_change(old: f64, new: f64) -> f64 {
@@ -1207,7 +1257,7 @@ fn print_traders(traders: &[Trader], settlements: &[Settlement]) {
         header_cell("Home"),
         header_cell("Money"),
         header_cell("Capacity"),
-        header_cell("Risk γ"),
+        header_cell("Risk tol"),
     ]);
 
     for t in traders {
@@ -1217,7 +1267,7 @@ fn print_traders(traders: &[Trader], settlements: &[Settlement]) {
             Cell::new(&settlements[t.home_base].name).set_alignment(CellAlignment::Left),
             num_cell(&format!("{:.1}", t.money)).fg(Color::Green),
             num_cell(&format!("{:.0}/mo", t.trade_capacity)),
-            num_cell(&format!("{:.1}", t.risk_aversion)),
+            num_cell(&format!("{:.2}", t.risk_tolerance)),
         ]);
     }
 
@@ -1297,12 +1347,7 @@ fn parse_args() -> (u32, bool) {
     (months, quiet)
 }
 
-fn print_long_run_summary(
-    months: u32,
-    shipments: &[u32],
-    money: &[[f64; 3]],
-    world: &World,
-) {
+fn print_long_run_summary(months: u32, shipments: &[u32], money: &[[f64; 3]], world: &World) {
     let names = ["Greenworld", "Ironmoon", "Forge Prime"];
     let avg_shipments = shipments.iter().sum::<u32>() as f64 / months as f64;
     let months_without_trade = shipments.iter().filter(|&&s| s == 0).count();
@@ -1401,7 +1446,9 @@ fn create_demo_world() -> World {
         },
     ];
 
-    let traders = vec![
+    let settlements = vec![farm_world, mining_world, factory_world];
+
+    let mut traders = vec![
         Trader {
             id: 0,
             name: "Free Merchants".to_string(),
@@ -1409,7 +1456,8 @@ fn create_demo_world() -> World {
             home_base: 0,
             money: 1000.0,
             trade_capacity: 80.0,
-            risk_aversion: 2.0,
+            risk_tolerance: 0.55,
+            known_prices: HashMap::new(),
         },
         Trader {
             id: 1,
@@ -1418,11 +1466,21 @@ fn create_demo_world() -> World {
             home_base: 1,
             money: 1000.0,
             trade_capacity: 80.0,
-            risk_aversion: 0.5,
+            risk_tolerance: 0.75,
+            known_prices: HashMap::new(),
         },
     ];
 
-    let settlements = vec![farm_world, mining_world, factory_world];
+    for trader in &mut traders {
+        for settlement_id in 0..settlements.len() {
+            for &good in &[Good::Food, Good::Ore, Good::Tools] {
+                trader.known_prices.insert(
+                    (settlement_id, good),
+                    settlements[settlement_id].prices[&good],
+                );
+            }
+        }
+    }
 
     let mut world = World {
         month: 0,
