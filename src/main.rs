@@ -5,6 +5,8 @@ use colored::Colorize;
 use comfy_table::presets::UTF8_FULL_CONDENSED;
 use comfy_table::{Attribute, Cell, CellAlignment, Color, ContentArrangement, Table};
 use rand::Rng;
+use rand::SeedableRng;
+use rand::rngs::StdRng;
 
 type SettlementId = usize;
 type RouteId = usize;
@@ -41,6 +43,50 @@ const MIN_HEURISTIC_SPREAD: f64 = 0.5;
 /// How wrong one-hop market rumors can be (± fraction).
 const RUMOR_NOISE: f64 = 0.1;
 const DEFAULT_MONTHS: u32 = 12;
+const DEFAULT_SEED: u64 = 42;
+const COMPARE_MONTHS: u32 = 12;
+
+#[derive(Debug, Clone, Copy)]
+struct SimulationConfig {
+    name: &'static str,
+    /// When false, traders see live prices everywhere (omniscient baseline).
+    stale_prices: bool,
+    seed: u64,
+    months: u32,
+    verbose: bool,
+}
+
+impl SimulationConfig {
+    fn production(months: u32, seed: u64, verbose: bool) -> Self {
+        Self {
+            name: "default",
+            stale_prices: true,
+            seed,
+            months,
+            verbose,
+        }
+    }
+
+    fn named(name: &str, seed: u64, months: u32, verbose: bool) -> Self {
+        match name {
+            "baseline" => Self {
+                name: "baseline",
+                stale_prices: false,
+                seed,
+                months,
+                verbose,
+            },
+            "stale-prices" => Self {
+                name: "stale-prices",
+                stale_prices: true,
+                seed,
+                months,
+                verbose,
+            },
+            other => panic!("unknown experiment {other:?}; try: baseline, stale-prices, compare"),
+        }
+    }
+}
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 enum Good {
@@ -194,6 +240,7 @@ enum Event {
 struct World {
     month: u32,
     expected_total_money: f64,
+    config: SimulationConfig,
 
     settlements: Vec<Settlement>,
     routes: Vec<Route>,
@@ -201,6 +248,7 @@ struct World {
 
     shipments: Vec<Shipment>,
     events: Vec<Event>,
+    rng: StdRng,
 }
 
 impl World {
@@ -420,7 +468,9 @@ impl World {
             }
         }
 
-        self.refresh_trader_price_knowledge();
+        if self.config.stale_prices {
+            self.refresh_trader_price_knowledge();
+        }
     }
 
     fn route_neighbors(&self, settlement_id: SettlementId) -> Vec<SettlementId> {
@@ -457,6 +507,9 @@ impl World {
     }
 
     fn refresh_trader_price_knowledge(&mut self) {
+        if !self.config.stale_prices {
+            return;
+        }
         for trader_id in 0..self.traders.len() {
             let location = self.traders[trader_id].location;
             let home_base = self.traders[trader_id].home_base;
@@ -478,6 +531,9 @@ impl World {
     }
 
     fn sync_trader_prices_at(&mut self, trader_id: TraderId, settlement_id: SettlementId) {
+        if !self.config.stale_prices {
+            return;
+        }
         for &good in &[Good::Food, Good::Ore, Good::Tools] {
             self.traders[trader_id].known_prices.insert(
                 (settlement_id, good),
@@ -493,6 +549,10 @@ impl World {
         settlement_id: SettlementId,
         good: Good,
     ) -> f64 {
+        if !self.config.stale_prices {
+            return self.settlements[settlement_id].prices[&good];
+        }
+
         let trader = &self.traders[trader_id];
         let fresh = settlement_id == trader.location || settlement_id == trader.home_base;
         let quote = if fresh {
@@ -713,8 +773,6 @@ impl World {
 
     fn advance_shipments(&mut self) {
         let mut remaining_shipments = Vec::new();
-        let mut rng = rand::thread_rng();
-
         let pending: Vec<Shipment> = self.shipments.drain(..).collect();
 
         for mut shipment in pending {
@@ -722,7 +780,7 @@ impl World {
                 if let Some(lost) = apply_monthly_cargo_risk(
                     &mut shipment.quantity,
                     shipment.effective_monthly_incident_rate,
-                    &mut rng,
+                    &mut self.rng,
                 ) {
                     self.events.push(Event::CargoLost {
                         trader: shipment.trader,
@@ -1265,13 +1323,92 @@ fn print_traders(traders: &[Trader], settlements: &[Settlement]) {
     println!("{table}");
 }
 
-fn main() {
-    let (months, quiet) = parse_args();
-    let mut world = create_demo_world();
-    let mut monthly_shipments = Vec::new();
-    let mut monthly_money: Vec<[f64; 3]> = Vec::new();
+#[derive(Debug)]
+struct SimulationSummary {
+    experiment: String,
+    months: u32,
+    shipments_created: u32,
+    shipments_arrived: u32,
+    cargo_losses: u32,
+    shortages: u32,
+    price_changes: u32,
+    months_with_trade: u32,
+    last_month_with_trade: u32,
+    trader_money_spread: f64,
+    min_settlement_money: f64,
+    total_shortage_unmet: f64,
+    trader_money: Vec<f64>,
+}
 
-    if !quiet {
+impl SimulationSummary {
+    fn from_events(
+        experiment: &str,
+        months: u32,
+        events: &[Event],
+        world: &World,
+        months_with_trade: u32,
+        last_month_with_trade: u32,
+    ) -> Self {
+        let mut shipments_created = 0;
+        let mut shipments_arrived = 0;
+        let mut cargo_losses = 0;
+        let mut shortages = 0;
+        let mut price_changes = 0;
+        let mut total_shortage_unmet = 0.0;
+
+        for event in events {
+            match event {
+                Event::ShipmentCreated { .. } => shipments_created += 1,
+                Event::ShipmentArrived { .. } => shipments_arrived += 1,
+                Event::CargoLost { .. } => cargo_losses += 1,
+                Event::Shortage { unmet, .. } => {
+                    shortages += 1;
+                    total_shortage_unmet += unmet;
+                }
+                Event::PriceChanged { .. } => price_changes += 1,
+                _ => {}
+            }
+        }
+
+        let trader_money: Vec<f64> = world.traders.iter().map(|t| t.money).collect();
+        let trader_money_spread = trader_money.iter().copied().reduce(f64::max).unwrap_or(0.0)
+            - trader_money.iter().copied().reduce(f64::min).unwrap_or(0.0);
+        let min_settlement_money = world
+            .settlements
+            .iter()
+            .map(|s| s.money)
+            .reduce(f64::min)
+            .unwrap_or(0.0);
+
+        Self {
+            experiment: experiment.to_string(),
+            months,
+            shipments_created,
+            shipments_arrived,
+            cargo_losses,
+            shortages,
+            price_changes,
+            months_with_trade,
+            last_month_with_trade,
+            trader_money_spread,
+            min_settlement_money,
+            total_shortage_unmet,
+            trader_money,
+        }
+    }
+}
+
+fn run_simulation(config: SimulationConfig) -> SimulationSummary {
+    let mut world = create_demo_world(config);
+    let mut all_events = Vec::new();
+    let mut months_with_trade = 0;
+    let mut last_month_with_trade = 0;
+
+    if config.verbose {
+        println!(
+            "{}",
+            format!("Experiment: {}", config.name).bold().cyan()
+        );
         println!("{}", "Initial state:".bold().cyan());
         print_settlements(&world.settlements);
         println!();
@@ -1279,7 +1416,214 @@ fn main() {
         println!();
     }
 
-    for _ in 0..months {
+    for _ in 0..config.months {
+        world.tick_month();
+
+        let month_events: Vec<Event> = world.events.drain(..).collect();
+        if month_events
+            .iter()
+            .any(|e| matches!(e, Event::ShipmentCreated { .. }))
+        {
+            months_with_trade += 1;
+            last_month_with_trade = world.month;
+        }
+
+        if config.verbose {
+            println!(
+                "\n{}",
+                format!("═══ Month {} ═══", world.month).bold().cyan()
+            );
+            print_events(&month_events, &world);
+            println!();
+            print_settlements(&world.settlements);
+            println!();
+            print_traders(&world.traders, &world.settlements);
+        }
+
+        all_events.extend(month_events);
+    }
+
+    SimulationSummary::from_events(
+        config.name,
+        config.months,
+        &all_events,
+        &world,
+        months_with_trade,
+        last_month_with_trade,
+    )
+}
+
+fn print_comparison_table(summaries: &[SimulationSummary]) {
+    let months = summaries.first().map(|s| s.months).unwrap_or(COMPARE_MONTHS);
+    let mut table = styled_table();
+    table.set_header(vec![
+        header_cell("Experiment"),
+        header_cell("Shipments"),
+        header_cell("Arrived"),
+        header_cell("CargoLost"),
+        header_cell("Shortages"),
+        header_cell("Price Δ"),
+        header_cell("Trade mo"),
+        header_cell("Last trade"),
+        header_cell("Trader spread"),
+        header_cell("Min settlement $"),
+        header_cell("Unmet demand"),
+    ]);
+
+    for s in summaries {
+        table.add_row(vec![
+            place_cell(&s.experiment),
+            num_cell(&s.shipments_created.to_string()),
+            num_cell(&s.shipments_arrived.to_string()),
+            num_cell(&s.cargo_losses.to_string()),
+            num_cell(&s.shortages.to_string()),
+            num_cell(&s.price_changes.to_string()),
+            num_cell(&format!("{}/{}", s.months_with_trade, s.months)),
+            num_cell(&s.last_month_with_trade.to_string()),
+            num_cell(&format!("{:.1}", s.trader_money_spread)),
+            num_cell(&format!("{:.1}", s.min_settlement_money)),
+            num_cell(&format!("{:.0}", s.total_shortage_unmet)),
+        ]);
+    }
+
+    println!("{table}");
+    println!();
+    for s in summaries {
+        let money: Vec<String> = s.trader_money.iter().map(|m| format!("{m:.1}")).collect();
+        println!(
+            "  {} → trader money [{}], last trade month {}",
+            s.experiment,
+            money.join(", "),
+            if s.last_month_with_trade == 0 {
+                "never".to_string()
+            } else if s.last_month_with_trade < s.months {
+                s.last_month_with_trade.to_string()
+            } else {
+                "still active".to_string()
+            }
+        );
+    }
+    println!("(compare ran {months} months per variant)");
+}
+
+struct CliArgs {
+    experiment: Option<String>,
+    months: u32,
+    seed: u64,
+    quiet: bool,
+}
+
+fn parse_args() -> CliArgs {
+    let mut experiment = None;
+    let mut months = DEFAULT_MONTHS;
+    let mut seed = DEFAULT_SEED;
+    let mut quiet = false;
+
+    let mut args = env::args().skip(1);
+    while let Some(arg) = args.next() {
+        match arg.as_str() {
+            "--experiment" | "-e" => {
+                experiment = Some(args.next().expect("missing value for --experiment"));
+            }
+            "--months" | "-m" => {
+                months = args
+                    .next()
+                    .expect("missing value for --months")
+                    .parse()
+                    .expect("months must be a u32");
+            }
+            "--seed" => {
+                seed = args
+                    .next()
+                    .expect("missing value for --seed")
+                    .parse()
+                    .expect("seed must be a u64");
+            }
+            "--quiet" | "-q" => quiet = true,
+            "--compare" => experiment = Some("compare".to_string()),
+            "--help" | "-h" => {
+                println!(
+                    "Usage: mundios [OPTIONS]\n\
+                     \n\
+                     Default: full economy sim with imperfect prices ({DEFAULT_MONTHS} months)\n\
+                     \n\
+                     Options:\n\
+                       --months N, -m     Simulation length (default {DEFAULT_MONTHS})\n\
+                       --quiet, -q          Summary output only\n\
+                       --compare            Compare baseline vs stale-prices ({COMPARE_MONTHS} mo)\n\
+                       --experiment NAME    baseline | stale-prices\n\
+                       --seed N             RNG seed (default {DEFAULT_SEED})"
+                );
+                std::process::exit(0);
+            }
+            other if !other.starts_with('-') => {
+                experiment = Some(other.to_string());
+            }
+            _ => {}
+        }
+    }
+
+    CliArgs {
+        experiment,
+        months,
+        seed,
+        quiet,
+    }
+}
+
+fn main() {
+    let cli = parse_args();
+
+    if cli.experiment.as_deref() == Some("compare") {
+        let summaries: Vec<SimulationSummary> = ["baseline", "stale-prices"]
+            .iter()
+            .map(|name| {
+                run_simulation(SimulationConfig::named(
+                    name,
+                    cli.seed,
+                    COMPARE_MONTHS,
+                    false,
+                ))
+            })
+            .collect();
+        print_comparison_table(&summaries);
+        return;
+    }
+
+    if let Some(name) = cli.experiment {
+        let config = SimulationConfig::named(&name, cli.seed, cli.months, !cli.quiet);
+        let summary = run_simulation(config);
+        if cli.quiet {
+            println!(
+                "{}: shipments={} arrived={} shortages={} trade_months={}/{} last_trade={} trader_spread={:.1} min_settlement=${:.1}",
+                summary.experiment,
+                summary.shipments_created,
+                summary.shipments_arrived,
+                summary.shortages,
+                summary.months_with_trade,
+                summary.months,
+                summary.last_month_with_trade,
+                summary.trader_money_spread,
+                summary.min_settlement_money,
+            );
+        }
+        return;
+    }
+
+    let config = SimulationConfig::production(cli.months, cli.seed, !cli.quiet);
+    let mut world = create_demo_world(config);
+    let mut monthly_shipments = Vec::new();
+    let mut monthly_money: Vec<[f64; 3]> = Vec::new();
+
+    if !cli.quiet {
+        println!("{}", "Initial state:".bold().cyan());
+        print_settlements(&world.settlements);
+        println!();
+        print_traders(&world.traders, &world.settlements);
+        println!();
+    }
+
+    for _ in 0..cli.months {
         world.tick_month();
 
         let events: Vec<Event> = world.events.drain(..).collect();
@@ -1294,7 +1638,7 @@ fn main() {
             world.settlements[2].money,
         ]);
 
-        if !quiet {
+        if !cli.quiet {
             println!(
                 "\n{}",
                 format!("═══ Month {} ═══", world.month).bold().cyan()
@@ -1307,35 +1651,9 @@ fn main() {
         }
     }
 
-    if quiet || months > 24 {
-        print_long_run_summary(months, &monthly_shipments, &monthly_money, &world);
+    if cli.quiet || cli.months > 24 {
+        print_long_run_summary(cli.months, &monthly_shipments, &monthly_money, &world);
     }
-}
-
-fn parse_args() -> (u32, bool) {
-    let mut months = DEFAULT_MONTHS;
-    let mut quiet = false;
-
-    let mut args = env::args().skip(1);
-    while let Some(arg) = args.next() {
-        match arg.as_str() {
-            "--months" | "-m" => {
-                months = args
-                    .next()
-                    .expect("missing value for --months")
-                    .parse()
-                    .expect("months must be a u32");
-            }
-            "--quiet" | "-q" => quiet = true,
-            "--help" | "-h" => {
-                println!("Usage: mundios [--months N] [--quiet]");
-                std::process::exit(0);
-            }
-            _ => {}
-        }
-    }
-
-    (months, quiet)
 }
 
 fn print_long_run_summary(months: u32, shipments: &[u32], money: &[[f64; 3]], world: &World) {
@@ -1368,7 +1686,7 @@ fn print_long_run_summary(months: u32, shipments: &[u32], money: &[[f64; 3]], wo
     );
 }
 
-fn create_demo_world() -> World {
+fn create_demo_world(config: SimulationConfig) -> World {
     let base = base_prices();
 
     let farm_world = Settlement {
@@ -1465,13 +1783,17 @@ fn create_demo_world() -> World {
     let mut world = World {
         month: 0,
         expected_total_money: 0.0,
+        config,
         settlements,
         routes,
         traders,
         shipments: Vec::new(),
         events: Vec::new(),
+        rng: StdRng::seed_from_u64(config.seed),
     };
-    world.refresh_trader_price_knowledge();
+    if world.config.stale_prices {
+        world.refresh_trader_price_knowledge();
+    }
     world.expected_total_money = total_money(&world);
     world
 }
