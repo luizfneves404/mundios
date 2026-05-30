@@ -1,9 +1,12 @@
 use std::collections::HashMap;
+use std::env;
 
 use colored::Colorize;
 use comfy_table::presets::UTF8_FULL_CONDENSED;
 use comfy_table::{Attribute, Cell, CellAlignment, Color, ContentArrangement, Table};
 use rand::Rng;
+use rand::SeedableRng;
+use rand::rngs::StdRng;
 
 type SettlementId = usize;
 type RouteId = usize;
@@ -14,6 +17,76 @@ const FAMILIARITY_FACTOR: f64 = 0.7;
 
 /// Monthly upkeep per unit of trade capacity, paid to home_base.
 const UPKEEP_PER_CAPACITY: f64 = 0.5;
+/// Crew, supplies, and services bought at the trader's current settlement.
+const LOCAL_SPEND_PER_CAPACITY: f64 = 0.5;
+/// Fraction of trader wealth above reserve spent locally each month.
+const TRADER_REPATRIATION_RATE: f64 = 0.15;
+/// Minimum cash traders keep for operating the next month's routes.
+const TRADER_OPERATING_RESERVE: f64 = 400.0;
+/// Settlements may borrow against near-term production while waiting for export revenue.
+const CREDIT_MONTHS_OF_PRODUCTION: f64 = 3.0;
+/// Traders cannot keep more than this fraction of import revenue as profit.
+const MAX_TRADER_MARGIN: f64 = 0.15;
+/// Monthly interest charged on settlement debt (paid to creditors with positive balances).
+const DEBT_INTEREST_RATE: f64 = 0.02;
+/// At maximum debt stress, consumption is cut by this fraction (austerity).
+const MAX_AUSTERITY: f64 = 0.5;
+/// Above this treasury balance, settlements gradually increase consumption (prosperity spending).
+const PROSPERITY_THRESHOLD: f64 = 2500.0;
+/// How quickly production recovers toward full output after shortages ease.
+const PRODUCTION_RECOVERY_RATE: f64 = 0.2;
+
+/// Target stockpile (in months of consumption) that triggers import demand.
+const STOCK_TARGET_MONTHS: f64 = 1.5;
+/// Minimum per-unit spread (sell - buy - transport) a trader wants to see.
+const MIN_HEURISTIC_SPREAD: f64 = 0.5;
+/// How wrong one-hop market rumors can be (± fraction).
+const RUMOR_NOISE: f64 = 0.1;
+const DEFAULT_MONTHS: u32 = 12;
+const DEFAULT_SEED: u64 = 42;
+const COMPARE_MONTHS: u32 = 12;
+
+#[derive(Debug, Clone, Copy)]
+struct SimulationConfig {
+    name: &'static str,
+    /// When false, traders see live prices everywhere (omniscient baseline).
+    stale_prices: bool,
+    seed: u64,
+    months: u32,
+    verbose: bool,
+}
+
+impl SimulationConfig {
+    fn production(months: u32, seed: u64, verbose: bool) -> Self {
+        Self {
+            name: "default",
+            stale_prices: true,
+            seed,
+            months,
+            verbose,
+        }
+    }
+
+    fn named(name: &str, seed: u64, months: u32, verbose: bool) -> Self {
+        match name {
+            "baseline" => Self {
+                name: "baseline",
+                stale_prices: false,
+                seed,
+                months,
+                verbose,
+            },
+            "stale-prices" => Self {
+                name: "stale-prices",
+                stale_prices: true,
+                seed,
+                months,
+                verbose,
+            },
+            other => panic!("unknown experiment {other:?}; try: baseline, stale-prices, compare"),
+        }
+    }
+}
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 enum Good {
@@ -34,6 +107,9 @@ struct Settlement {
     consumption: HashMap<Good, f64>,
 
     money: f64,
+
+    /// Scales output after shortages (1.0 = full capacity).
+    production_scale: HashMap<Good, f64>,
 }
 
 #[derive(Debug, Clone)]
@@ -67,8 +143,11 @@ struct Trader {
     /// Monthly pool of trade activity; each shipment uses at least 1 unit.
     trade_capacity: f64,
 
-    /// CRRA coefficient γ — higher values reject risky trades more strongly.
-    risk_aversion: f64,
+    /// 0–1: willingness to run routes with cargo risk (higher = bolder).
+    risk_tolerance: f64,
+
+    /// Last observed prices; fresh at current location and home base only.
+    known_prices: HashMap<(SettlementId, Good), f64>,
 }
 
 #[derive(Debug, Clone)]
@@ -120,6 +199,19 @@ enum Event {
         home_base: SettlementId,
         amount: f64,
     },
+    LocalSpending {
+        trader: TraderId,
+        settlement: SettlementId,
+        amount: f64,
+    },
+    DebtInterest {
+        debtor: SettlementId,
+        amount: f64,
+    },
+    Austerity {
+        settlement: SettlementId,
+        multiplier: f64,
+    },
     ShipmentCreated {
         trader: TraderId,
         good: Good,
@@ -148,6 +240,7 @@ enum Event {
 struct World {
     month: u32,
     expected_total_money: f64,
+    config: SimulationConfig,
 
     settlements: Vec<Settlement>,
     routes: Vec<Route>,
@@ -155,6 +248,7 @@ struct World {
 
     shipments: Vec<Shipment>,
     events: Vec<Event>,
+    rng: StdRng,
 }
 
 impl World {
@@ -162,10 +256,12 @@ impl World {
         self.month += 1;
 
         self.reset_route_capacity();
+        self.recover_production_capacity();
         self.produce();
         self.consume();
         self.update_prices();
-        self.pay_trader_upkeep();
+        self.service_debt_interest();
+        self.pay_trader_expenses();
         self.create_trade_shipments();
         self.advance_shipments();
 
@@ -183,26 +279,79 @@ impl World {
         }
     }
 
+    fn recover_production_capacity(&mut self) {
+        for settlement in &mut self.settlements {
+            for good in [Good::Food, Good::Ore, Good::Tools] {
+                let scale = settlement.production_scale.entry(good).or_insert(1.0);
+                if *scale < 1.0 {
+                    *scale = (*scale + PRODUCTION_RECOVERY_RATE).min(1.0);
+                }
+            }
+        }
+    }
+
     fn produce(&mut self) {
         for settlement in &mut self.settlements {
             for (&good, &amount) in &settlement.production {
-                *settlement.stockpiles.entry(good).or_insert(0.0) += amount;
+                let scale = *settlement.production_scale.get(&good).unwrap_or(&1.0);
+                let produced = amount * scale;
+                *settlement.stockpiles.entry(good).or_insert(0.0) += produced;
 
                 self.events.push(Event::Produced {
                     settlement: settlement.id,
                     good,
-                    amount,
+                    amount: produced,
                 });
             }
         }
     }
 
+    fn apply_shortage_effects(
+        &mut self,
+        settlement_id: SettlementId,
+        good: Good,
+        needed: f64,
+        consumed: f64,
+    ) {
+        if needed <= 0.0 {
+            return;
+        }
+
+        let fulfillment = (consumed / needed).clamp(0.0, 1.0);
+        let settlement = &mut self.settlements[settlement_id];
+
+        match good {
+            Good::Food => {
+                for produced_good in settlement.production.keys().copied().collect::<Vec<_>>() {
+                    settlement
+                        .production_scale
+                        .insert(produced_good, fulfillment);
+                }
+            }
+            Good::Ore if settlement_id == 2 => {
+                settlement.production_scale.insert(Good::Tools, fulfillment);
+            }
+            _ => {}
+        }
+    }
+
     fn consume(&mut self) {
+        let mut shortage_updates = Vec::new();
+
         for settlement in &mut self.settlements {
+            let austerity = consumption_multiplier(settlement);
+            if austerity < 0.99 {
+                self.events.push(Event::Austerity {
+                    settlement: settlement.id,
+                    multiplier: austerity,
+                });
+            }
+
             for (&good, &needed) in &settlement.consumption {
+                let effective_need = needed * austerity;
                 let available = settlement.stockpiles.entry(good).or_insert(0.0);
 
-                let consumed = needed.min(*available);
+                let consumed = effective_need.min(*available);
                 *available -= consumed;
 
                 self.events.push(Event::Consumed {
@@ -211,14 +360,71 @@ impl World {
                     amount: consumed,
                 });
 
-                if consumed < needed {
+                if consumed < effective_need {
                     self.events.push(Event::Shortage {
                         settlement: settlement.id,
                         good,
-                        unmet: needed - consumed,
+                        unmet: effective_need - consumed,
                     });
+                    shortage_updates.push((settlement.id, good, effective_need, consumed));
                 }
             }
+        }
+
+        for (settlement_id, good, needed, consumed) in shortage_updates {
+            self.apply_shortage_effects(settlement_id, good, needed, consumed);
+        }
+    }
+
+    fn try_debit_settlement(&mut self, settlement_id: SettlementId, amount: f64) -> f64 {
+        let floor = -credit_limit(&self.settlements[settlement_id]);
+        let available = (self.settlements[settlement_id].money - floor).max(0.0);
+        let paid = amount.min(available);
+        self.settlements[settlement_id].money -= paid;
+        paid
+    }
+
+    fn service_debt_interest(&mut self) {
+        let debtors: Vec<(SettlementId, f64)> = self
+            .settlements
+            .iter()
+            .filter(|s| s.money < 0.0)
+            .map(|s| (s.id, -s.money))
+            .collect();
+
+        if debtors.is_empty() {
+            return;
+        }
+
+        let mut total_interest = 0.0;
+        for (debtor_id, debt) in &debtors {
+            let interest = debt * DEBT_INTEREST_RATE;
+            let paid = self.try_debit_settlement(*debtor_id, interest);
+            total_interest += paid;
+            if paid > 0.0 {
+                self.events.push(Event::DebtInterest {
+                    debtor: *debtor_id,
+                    amount: paid,
+                });
+            }
+        }
+
+        let creditor_pool: f64 = self
+            .settlements
+            .iter()
+            .filter(|s| s.money > 0.0)
+            .map(|s| s.money)
+            .sum();
+
+        if creditor_pool <= 0.0 || total_interest <= 0.0 {
+            return;
+        }
+
+        for settlement in &mut self.settlements {
+            if settlement.money <= 0.0 {
+                continue;
+            }
+            settlement.money += total_interest * settlement.money / creditor_pool;
         }
     }
 
@@ -232,7 +438,7 @@ impl World {
                 let stockpile = *settlement.stockpiles.get(&good).unwrap_or(&0.0);
                 let monthly_need = *settlement.consumption.get(&good).unwrap_or(&1.0);
 
-                let target_stockpile = monthly_need * 3.0;
+                let target_stockpile = monthly_need * STOCK_TARGET_MONTHS;
 
                 let scarcity_ratio = if stockpile <= 0.01 {
                     10.0
@@ -261,22 +467,138 @@ impl World {
                 }
             }
         }
+
+        if self.config.stale_prices {
+            self.refresh_trader_price_knowledge();
+        }
     }
 
-    fn pay_trader_upkeep(&mut self) {
+    fn route_neighbors(&self, settlement_id: SettlementId) -> Vec<SettlementId> {
+        let mut neighbors = Vec::new();
+        for route in &self.routes {
+            if route.a == settlement_id {
+                neighbors.push(route.b);
+            } else if route.b == settlement_id {
+                neighbors.push(route.a);
+            }
+        }
+        neighbors
+    }
+
+    fn markets_heard_by(&self, location: SettlementId, home_base: SettlementId) -> Vec<SettlementId> {
+        let mut heard = vec![location, home_base];
+        heard.extend(self.route_neighbors(location));
+        heard.extend(self.route_neighbors(home_base));
+        heard.sort_unstable();
+        heard.dedup();
+        heard
+    }
+
+    fn rumor_price(&self, trader_id: TraderId, settlement_id: SettlementId, good: Good) -> f64 {
+        let actual = self.settlements[settlement_id].prices[&good];
+        let good_idx = match good {
+            Good::Food => 0,
+            Good::Ore => 1,
+            Good::Tools => 2,
+        };
+        let hash = (trader_id * 31 + settlement_id * 17 + good_idx * 7) as f64;
+        let noise = ((hash % 100.0) / 100.0 - 0.5) * 2.0 * RUMOR_NOISE;
+        actual * (1.0 + noise)
+    }
+
+    fn refresh_trader_price_knowledge(&mut self) {
+        if !self.config.stale_prices {
+            return;
+        }
         for trader_id in 0..self.traders.len() {
-            let upkeep = self.traders[trader_id].trade_capacity * UPKEEP_PER_CAPACITY;
+            let location = self.traders[trader_id].location;
             let home_base = self.traders[trader_id].home_base;
-            let payment = upkeep.min(self.traders[trader_id].money);
+            let heard_from = self.markets_heard_by(location, home_base);
 
-            self.traders[trader_id].money -= payment;
-            self.settlements[home_base].money += payment;
+            for settlement_id in heard_from {
+                for &good in &[Good::Food, Good::Ore, Good::Tools] {
+                    let price = if settlement_id == location || settlement_id == home_base {
+                        self.settlements[settlement_id].prices[&good]
+                    } else {
+                        self.rumor_price(trader_id, settlement_id, good)
+                    };
+                    self.traders[trader_id]
+                        .known_prices
+                        .insert((settlement_id, good), price);
+                }
+            }
+        }
+    }
 
-            if payment > 0.0 {
+    fn sync_trader_prices_at(&mut self, trader_id: TraderId, settlement_id: SettlementId) {
+        if !self.config.stale_prices {
+            return;
+        }
+        for &good in &[Good::Food, Good::Ore, Good::Tools] {
+            self.traders[trader_id].known_prices.insert(
+                (settlement_id, good),
+                self.settlements[settlement_id].prices[&good],
+            );
+        }
+    }
+
+    /// Fresh quotes at current location and home; rumors or memory elsewhere.
+    fn trader_perceived_price(
+        &self,
+        trader_id: TraderId,
+        settlement_id: SettlementId,
+        good: Good,
+    ) -> f64 {
+        if !self.config.stale_prices {
+            return self.settlements[settlement_id].prices[&good];
+        }
+
+        let trader = &self.traders[trader_id];
+        let fresh = settlement_id == trader.location || settlement_id == trader.home_base;
+        let quote = if fresh {
+            self.settlements[settlement_id].prices[&good]
+        } else {
+            trader
+                .known_prices
+                .get(&(settlement_id, good))
+                .copied()
+                .unwrap_or(base_prices()[&good])
+        };
+        if fresh {
+            return quote;
+        }
+        let bias = (trader.risk_tolerance - 0.5) * 0.12;
+        quote * (1.0 + bias)
+    }
+
+    fn pay_trader_expenses(&mut self) {
+        for trader_id in 0..self.traders.len() {
+            let location = self.traders[trader_id].location;
+            let home_base = self.traders[trader_id].home_base;
+
+            let upkeep = self.traders[trader_id].trade_capacity * UPKEEP_PER_CAPACITY;
+            let upkeep_paid = upkeep.min(self.traders[trader_id].money);
+            self.traders[trader_id].money -= upkeep_paid;
+            self.settlements[home_base].money += upkeep_paid;
+            if upkeep_paid > 0.0 {
                 self.events.push(Event::UpkeepPaid {
                     trader: trader_id,
                     home_base,
-                    amount: payment,
+                    amount: upkeep_paid,
+                });
+            }
+
+            let capacity_spend = self.traders[trader_id].trade_capacity * LOCAL_SPEND_PER_CAPACITY;
+            let spendable = (self.traders[trader_id].money - TRADER_OPERATING_RESERVE).max(0.0);
+            let wealth_spend = spendable * TRADER_REPATRIATION_RATE;
+            let local_paid = capacity_spend.max(wealth_spend).min(spendable);
+            self.traders[trader_id].money -= local_paid;
+            self.settlements[location].money += local_paid;
+            if local_paid > 0.0 {
+                self.events.push(Event::LocalSpending {
+                    trader: trader_id,
+                    settlement: location,
+                    amount: local_paid,
                 });
             }
         }
@@ -287,9 +609,11 @@ impl World {
 
         for trader_id in 0..trader_count {
             let mut remaining_capacity = self.traders[trader_id].trade_capacity;
+            let mut blocked: Vec<(SettlementId, SettlementId, Good)> = Vec::new();
 
             while remaining_capacity >= 1.0 {
-                let Some(opportunity) = self.best_trade_for_trader(trader_id, remaining_capacity)
+                let Some(opportunity) =
+                    self.best_trade_for_trader(trader_id, remaining_capacity, &blocked)
                 else {
                     break;
                 };
@@ -298,38 +622,32 @@ impl World {
                 let buyer_id = opportunity.buyer;
                 let good = opportunity.good;
                 let buy_price = self.settlements[seller_id].prices[&good];
-                let buyer_price = opportunity.buyer_price;
+                let actual_buyer_price = self.settlements[buyer_id].prices[&good];
 
                 let seller_stock = self.settlements[seller_id]
                     .stockpiles
                     .get(&good)
                     .copied()
                     .unwrap_or(0.0);
-                let trader_money = self.traders[trader_id].money;
-                let buyer_money = self.settlements[buyer_id].money;
+                let buyer_spending_power = settlement_purchasing_power(&self.settlements[buyer_id]);
 
-                let affordable_by_trader = trader_money / buy_price;
-                let affordable_by_buyer = buyer_money / buyer_price;
+                let affordable_by_buyer = buyer_spending_power / actual_buyer_price;
                 let route_capacity_left = self.routes[opportunity.route].capacity_per_month
                     - self.routes[opportunity.route].used_capacity_this_month;
 
                 let quantity = opportunity
                     .suggested_quantity
                     .min(seller_stock)
-                    .min(affordable_by_trader)
                     .min(affordable_by_buyer)
                     .min(route_capacity_left)
                     .min(remaining_capacity)
                     .floor();
 
                 if quantity < 1.0 {
-                    break;
+                    blocked.push((seller_id, buyer_id, good));
+                    continue;
                 }
 
-                let purchase_cost = quantity * buy_price;
-
-                self.traders[trader_id].money -= purchase_cost;
-                self.settlements[seller_id].money += purchase_cost;
                 *self.settlements[seller_id]
                     .stockpiles
                     .entry(good)
@@ -350,7 +668,7 @@ impl World {
                     buyer: buyer_id,
                     route: opportunity.route,
                     buy_price,
-                    expected_sell_price: buyer_price,
+                    expected_sell_price: opportunity.buyer_price,
                     transport_cost_per_unit: route.cost_per_unit,
                     effective_monthly_incident_rate: effective_rate,
                     months_remaining: route.travel_months,
@@ -374,6 +692,7 @@ impl World {
         &self,
         trader_id: TraderId,
         max_capacity: f64,
+        excluded: &[(SettlementId, SettlementId, Good)],
     ) -> Option<TradeOpportunity> {
         let trader = &self.traders[trader_id];
         let mut best: Option<TradeOpportunity> = None;
@@ -382,47 +701,51 @@ impl World {
             let orientations = [(route.a, route.b), (route.b, route.a)];
 
             for &(seller_id, buyer_id) in &orientations {
-                let seller = &self.settlements[seller_id];
                 let buyer = &self.settlements[buyer_id];
                 let p_eff = effective_monthly_incident_rate(route, trader.location);
 
                 for &good in &[Good::Food, Good::Ore, Good::Tools] {
-                    let seller_price = seller.prices[&good];
-                    let buyer_price = buyer.prices[&good];
-
-                    let ev_per_unit = expected_profit_per_unit(
-                        seller_price,
-                        buyer_price,
-                        route.cost_per_unit,
-                        p_eff,
-                        route.travel_months,
-                    );
-
-                    if ev_per_unit <= 0.0 {
+                    if excluded
+                        .iter()
+                        .any(|&(s, b, g)| s == seller_id && b == buyer_id && g == good)
+                    {
                         continue;
                     }
 
-                    let stock = *seller.stockpiles.get(&good).unwrap_or(&0.0);
-                    let buyer_need = buyer.consumption.get(&good).copied().unwrap_or(1.0) * 3.0;
-                    let buyer_stock = *buyer.stockpiles.get(&good).unwrap_or(&0.0);
-                    let shortage = (buyer_need - buyer_stock).max(0.0);
+                    let seller_price = self.trader_perceived_price(trader_id, seller_id, good);
+                    let buyer_price = self.trader_perceived_price(trader_id, buyer_id, good);
+                    let spread = buyer_price - seller_price - route.cost_per_unit;
 
+                    let monthly_need = buyer.consumption.get(&good).copied().unwrap_or(1.0);
+                    let target_stock = monthly_need * STOCK_TARGET_MONTHS;
+                    let buyer_stock = *buyer.stockpiles.get(&good).unwrap_or(&0.0);
+                    let shortage = (target_stock - buyer_stock).max(0.0);
+
+                    if shortage < 1.0 {
+                        continue;
+                    }
+
+                    let buyer_urgency = (shortage / monthly_need).clamp(0.0, 2.0).min(1.0);
+                    let min_spread =
+                        MIN_HEURISTIC_SPREAD * (1.3 - trader.risk_tolerance - 0.3 * buyer_urgency);
+                    if spread < min_spread {
+                        continue;
+                    }
+
+                    let stock = *self.settlements[seller_id]
+                        .stockpiles
+                        .get(&good)
+                        .unwrap_or(&0.0);
                     let suggested_quantity = stock.min(shortage).min(max_capacity).floor();
 
                     if suggested_quantity < 1.0 {
                         continue;
                     }
 
-                    let score = trade_utility_score(
-                        trader.money,
-                        suggested_quantity,
-                        seller_price,
-                        buyer_price,
-                        route.cost_per_unit,
-                        p_eff,
-                        route.travel_months,
-                        trader.risk_aversion,
-                    );
+                    let cumulative_risk = 1.0 - (1.0 - p_eff).powi(route.travel_months as i32);
+                    let risk_discount = 1.0 - cumulative_risk * (1.0 - trader.risk_tolerance);
+                    let score =
+                        spread * suggested_quantity * risk_discount * (0.4 + 0.6 * buyer_urgency);
 
                     if score <= 0.0 {
                         continue;
@@ -450,14 +773,14 @@ impl World {
 
     fn advance_shipments(&mut self) {
         let mut remaining_shipments = Vec::new();
-        let mut rng = rand::thread_rng();
+        let pending: Vec<Shipment> = self.shipments.drain(..).collect();
 
-        for mut shipment in self.shipments.drain(..) {
+        for mut shipment in pending {
             if shipment.months_remaining > 0 {
                 if let Some(lost) = apply_monthly_cargo_risk(
                     &mut shipment.quantity,
                     shipment.effective_monthly_incident_rate,
-                    &mut rng,
+                    &mut self.rng,
                 ) {
                     self.events.push(Event::CargoLost {
                         trader: shipment.trader,
@@ -477,37 +800,51 @@ impl World {
             }
 
             let sell_price = self.settlements[shipment.buyer].prices[&shipment.good];
-            let route = &self.routes[shipment.route];
+            let route_a = self.routes[shipment.route].a;
+            let route_b = self.routes[shipment.route].b;
+            let transport_per_unit = self.routes[shipment.route].cost_per_unit;
 
             let revenue = shipment.quantity * sell_price;
             let purchase_cost = shipment.initial_quantity * shipment.buy_price;
-            let transport_cost = shipment.quantity * shipment.transport_cost_per_unit;
-            let transport_half = transport_cost / 2.0;
+            let transport_cost = shipment.quantity * transport_per_unit;
 
-            let profit = revenue - purchase_cost - transport_cost;
+            let raw_profit = revenue - purchase_cost - transport_cost;
+            let profit_cap = revenue * MAX_TRADER_MARGIN;
+            let profit = raw_profit.min(profit_cap);
+            let buyer_rebate = (raw_profit - profit).max(0.0);
+
+            let buyer_id = shipment.buyer;
+            let paid = self.try_debit_settlement(buyer_id, revenue);
+            let scale = if revenue > 0.0 { paid / revenue } else { 0.0 };
+            let delivered = shipment.quantity * scale;
+            let scaled_purchase = purchase_cost * scale;
+            let scaled_transport = transport_cost * scale;
+            let scaled_profit = profit * scale;
+            let scaled_rebate = buyer_rebate * scale;
 
             self.settlements[shipment.buyer]
                 .stockpiles
                 .entry(shipment.good)
-                .and_modify(|q| *q += shipment.quantity)
-                .or_insert(shipment.quantity);
+                .and_modify(|q| *q += delivered)
+                .or_insert(delivered);
 
-            self.settlements[shipment.buyer].money -= revenue;
-            self.traders[shipment.trader].money += revenue;
-            self.traders[shipment.trader].money -= transport_cost;
-            self.settlements[route.a].money += transport_half;
-            self.settlements[route.b].money += transport_half;
+            self.settlements[shipment.buyer].money += scaled_rebate;
+            self.settlements[shipment.seller].money += scaled_purchase;
+            self.settlements[route_a].money += scaled_transport / 2.0;
+            self.settlements[route_b].money += scaled_transport / 2.0;
+            self.traders[shipment.trader].money += scaled_profit;
 
             self.traders[shipment.trader].location = shipment.buyer;
+            self.sync_trader_prices_at(shipment.trader, shipment.buyer);
 
             self.events.push(Event::ShipmentArrived {
                 trader: shipment.trader,
                 good: shipment.good,
-                quantity: shipment.quantity,
+                quantity: delivered,
                 initial_quantity: shipment.initial_quantity,
                 seller: shipment.seller,
                 buyer: shipment.buyer,
-                profit,
+                profit: scaled_profit,
             });
         }
 
@@ -535,64 +872,6 @@ fn effective_monthly_incident_rate(route: &Route, trader_location: SettlementId)
     }
 }
 
-/// E[fraction delivered] with at most one incident per month and U[0,1] loss fraction.
-fn expected_delivery_fraction(p_eff: f64, travel_months: u32) -> f64 {
-    (1.0 - 0.5 * p_eff).powi(travel_months as i32)
-}
-
-/// Risk-neutral expected profit per unit (rational benchmark).
-fn expected_profit_per_unit(
-    seller_price: f64,
-    buyer_price: f64,
-    cost_per_unit: f64,
-    p_eff: f64,
-    travel_months: u32,
-) -> f64 {
-    let frac = expected_delivery_fraction(p_eff, travel_months);
-    frac * (buyer_price - seller_price - cost_per_unit) - (1.0 - frac) * seller_price
-}
-
-fn crra_utility(wealth: f64, gamma: f64) -> f64 {
-    if wealth <= 0.0 {
-        return f64::NEG_INFINITY;
-    }
-    if (gamma - 1.0).abs() < 1e-9 {
-        wealth.ln()
-    } else {
-        wealth.powf(1.0 - gamma) / (1.0 - gamma)
-    }
-}
-
-/// Decision score: E[U(wealth after trade)] - U(current wealth).
-fn trade_utility_score(
-    current_money: f64,
-    quantity: f64,
-    buy_price: f64,
-    sell_price: f64,
-    transport_per_unit: f64,
-    p_eff: f64,
-    travel_months: u32,
-    gamma: f64,
-) -> f64 {
-    let purchase = quantity * buy_price;
-    let transport = quantity * transport_per_unit;
-    let frac_ev = expected_delivery_fraction(p_eff, travel_months);
-
-    let p_good = (1.0 - p_eff).powi(travel_months as i32);
-    let p_bad = (1.0 - p_good) * 0.5;
-    let p_ev = (1.0 - p_good - p_bad).max(0.0);
-
-    let w_good = current_money - purchase - transport + quantity * sell_price;
-    let w_bad = current_money - purchase - transport;
-    let w_ev = current_money - purchase - transport + quantity * frac_ev * sell_price;
-
-    let u_current = crra_utility(current_money, gamma);
-    p_good * crra_utility(w_good, gamma)
-        + p_ev * crra_utility(w_ev, gamma)
-        + p_bad * crra_utility(w_bad, gamma)
-        - u_current
-}
-
 fn apply_monthly_cargo_risk(
     quantity: &mut f64,
     monthly_incident_rate: f64,
@@ -616,6 +895,55 @@ fn total_money(world: &World) -> f64 {
 
 fn base_prices() -> HashMap<Good, f64> {
     HashMap::from([(Good::Food, 10.0), (Good::Ore, 8.0), (Good::Tools, 20.0)])
+}
+
+fn monthly_production_value(settlement: &Settlement) -> f64 {
+    let base = base_prices();
+    settlement
+        .production
+        .iter()
+        .map(|(good, amount)| amount * base[good])
+        .sum()
+}
+
+fn credit_limit(settlement: &Settlement) -> f64 {
+    monthly_production_value(settlement) * CREDIT_MONTHS_OF_PRODUCTION
+}
+
+fn debt_stress(settlement: &Settlement) -> f64 {
+    if settlement.money >= 0.0 {
+        return 0.0;
+    }
+    let debt = -settlement.money;
+    let limit = credit_limit(settlement);
+    if limit <= 0.0 {
+        return 1.0;
+    }
+    (debt / limit).clamp(0.0, 1.0)
+}
+
+fn austerity_multiplier(debt_stress: f64) -> f64 {
+    1.0 - MAX_AUSTERITY * debt_stress
+}
+
+fn consumption_multiplier(settlement: &Settlement) -> f64 {
+    let mut multiplier = austerity_multiplier(debt_stress(settlement));
+    if settlement.money > PROSPERITY_THRESHOLD {
+        let prosperity =
+            ((settlement.money - PROSPERITY_THRESHOLD) / PROSPERITY_THRESHOLD).min(1.0) * 0.25;
+        multiplier *= 1.0 + prosperity;
+    }
+    multiplier
+}
+
+/// Cash on hand plus remaining borrowing capacity.
+fn settlement_purchasing_power(settlement: &Settlement) -> f64 {
+    let limit = credit_limit(settlement);
+    if settlement.money >= 0.0 {
+        settlement.money + limit
+    } else {
+        (limit + settlement.money).max(0.0)
+    }
 }
 
 fn percentage_change(old: f64, new: f64) -> f64 {
@@ -764,6 +1092,44 @@ fn format_event(event: &Event, world: &World) -> EventRow {
             good: None,
             details: format!("-{amount:.1}"),
             details_color: Some(Color::Yellow),
+        },
+        Event::LocalSpending {
+            trader,
+            settlement,
+            amount,
+        } => EventRow {
+            kind: "LocalSpend",
+            kind_color: Color::Yellow,
+            kind_bold: false,
+            place: format!(
+                "{} → {}",
+                world.traders[*trader].name,
+                settlement_name(*settlement)
+            ),
+            good: None,
+            details: format!("-{amount:.1}"),
+            details_color: Some(Color::Yellow),
+        },
+        Event::DebtInterest { debtor, amount } => EventRow {
+            kind: "Interest",
+            kind_color: Color::Red,
+            kind_bold: false,
+            place: settlement_name(*debtor),
+            good: None,
+            details: format!("-{amount:.1}"),
+            details_color: Some(Color::Red),
+        },
+        Event::Austerity {
+            settlement,
+            multiplier,
+        } => EventRow {
+            kind: "Austerity",
+            kind_color: Color::Red,
+            kind_bold: false,
+            place: settlement_name(*settlement),
+            good: None,
+            details: format!("{multiplier:.0}% demand"),
+            details_color: Some(Color::Red),
         },
         Event::ShipmentCreated {
             trader,
@@ -940,7 +1306,7 @@ fn print_traders(traders: &[Trader], settlements: &[Settlement]) {
         header_cell("Home"),
         header_cell("Money"),
         header_cell("Capacity"),
-        header_cell("Risk γ"),
+        header_cell("Risk tol"),
     ]);
 
     for t in traders {
@@ -950,40 +1316,377 @@ fn print_traders(traders: &[Trader], settlements: &[Settlement]) {
             Cell::new(&settlements[t.home_base].name).set_alignment(CellAlignment::Left),
             num_cell(&format!("{:.1}", t.money)).fg(Color::Green),
             num_cell(&format!("{:.0}/mo", t.trade_capacity)),
-            num_cell(&format!("{:.1}", t.risk_aversion)),
+            num_cell(&format!("{:.2}", t.risk_tolerance)),
         ]);
     }
 
     println!("{table}");
 }
 
-fn main() {
-    let mut world = create_demo_world();
+#[derive(Debug)]
+struct SimulationSummary {
+    experiment: String,
+    months: u32,
+    shipments_created: u32,
+    shipments_arrived: u32,
+    cargo_losses: u32,
+    shortages: u32,
+    price_changes: u32,
+    months_with_trade: u32,
+    last_month_with_trade: u32,
+    trader_money_spread: f64,
+    min_settlement_money: f64,
+    total_shortage_unmet: f64,
+    trader_money: Vec<f64>,
+}
 
-    println!("{}", "Initial state:".bold().cyan());
-    print_settlements(&world.settlements);
-    println!();
-    print_traders(&world.traders, &world.settlements);
-    println!();
+impl SimulationSummary {
+    fn from_events(
+        experiment: &str,
+        months: u32,
+        events: &[Event],
+        world: &World,
+        months_with_trade: u32,
+        last_month_with_trade: u32,
+    ) -> Self {
+        let mut shipments_created = 0;
+        let mut shipments_arrived = 0;
+        let mut cargo_losses = 0;
+        let mut shortages = 0;
+        let mut price_changes = 0;
+        let mut total_shortage_unmet = 0.0;
 
-    for _ in 0..12 {
-        world.tick_month();
+        for event in events {
+            match event {
+                Event::ShipmentCreated { .. } => shipments_created += 1,
+                Event::ShipmentArrived { .. } => shipments_arrived += 1,
+                Event::CargoLost { .. } => cargo_losses += 1,
+                Event::Shortage { unmet, .. } => {
+                    shortages += 1;
+                    total_shortage_unmet += unmet;
+                }
+                Event::PriceChanged { .. } => price_changes += 1,
+                _ => {}
+            }
+        }
 
-        println!(
-            "\n{}",
-            format!("═══ Month {} ═══", world.month).bold().cyan()
-        );
+        let trader_money: Vec<f64> = world.traders.iter().map(|t| t.money).collect();
+        let trader_money_spread = trader_money.iter().copied().reduce(f64::max).unwrap_or(0.0)
+            - trader_money.iter().copied().reduce(f64::min).unwrap_or(0.0);
+        let min_settlement_money = world
+            .settlements
+            .iter()
+            .map(|s| s.money)
+            .reduce(f64::min)
+            .unwrap_or(0.0);
 
-        let events: Vec<Event> = world.events.drain(..).collect();
-        print_events(&events, &world);
-        println!();
-        print_settlements(&world.settlements);
-        println!();
-        print_traders(&world.traders, &world.settlements);
+        Self {
+            experiment: experiment.to_string(),
+            months,
+            shipments_created,
+            shipments_arrived,
+            cargo_losses,
+            shortages,
+            price_changes,
+            months_with_trade,
+            last_month_with_trade,
+            trader_money_spread,
+            min_settlement_money,
+            total_shortage_unmet,
+            trader_money,
+        }
     }
 }
 
-fn create_demo_world() -> World {
+fn run_simulation(config: SimulationConfig) -> SimulationSummary {
+    let mut world = create_demo_world(config);
+    let mut all_events = Vec::new();
+    let mut months_with_trade = 0;
+    let mut last_month_with_trade = 0;
+
+    if config.verbose {
+        println!(
+            "{}",
+            format!("Experiment: {}", config.name).bold().cyan()
+        );
+        println!("{}", "Initial state:".bold().cyan());
+        print_settlements(&world.settlements);
+        println!();
+        print_traders(&world.traders, &world.settlements);
+        println!();
+    }
+
+    for _ in 0..config.months {
+        world.tick_month();
+
+        let month_events: Vec<Event> = world.events.drain(..).collect();
+        if month_events
+            .iter()
+            .any(|e| matches!(e, Event::ShipmentCreated { .. }))
+        {
+            months_with_trade += 1;
+            last_month_with_trade = world.month;
+        }
+
+        if config.verbose {
+            println!(
+                "\n{}",
+                format!("═══ Month {} ═══", world.month).bold().cyan()
+            );
+            print_events(&month_events, &world);
+            println!();
+            print_settlements(&world.settlements);
+            println!();
+            print_traders(&world.traders, &world.settlements);
+        }
+
+        all_events.extend(month_events);
+    }
+
+    SimulationSummary::from_events(
+        config.name,
+        config.months,
+        &all_events,
+        &world,
+        months_with_trade,
+        last_month_with_trade,
+    )
+}
+
+fn print_comparison_table(summaries: &[SimulationSummary]) {
+    let months = summaries.first().map(|s| s.months).unwrap_or(COMPARE_MONTHS);
+    let mut table = styled_table();
+    table.set_header(vec![
+        header_cell("Experiment"),
+        header_cell("Shipments"),
+        header_cell("Arrived"),
+        header_cell("CargoLost"),
+        header_cell("Shortages"),
+        header_cell("Price Δ"),
+        header_cell("Trade mo"),
+        header_cell("Last trade"),
+        header_cell("Trader spread"),
+        header_cell("Min settlement $"),
+        header_cell("Unmet demand"),
+    ]);
+
+    for s in summaries {
+        table.add_row(vec![
+            place_cell(&s.experiment),
+            num_cell(&s.shipments_created.to_string()),
+            num_cell(&s.shipments_arrived.to_string()),
+            num_cell(&s.cargo_losses.to_string()),
+            num_cell(&s.shortages.to_string()),
+            num_cell(&s.price_changes.to_string()),
+            num_cell(&format!("{}/{}", s.months_with_trade, s.months)),
+            num_cell(&s.last_month_with_trade.to_string()),
+            num_cell(&format!("{:.1}", s.trader_money_spread)),
+            num_cell(&format!("{:.1}", s.min_settlement_money)),
+            num_cell(&format!("{:.0}", s.total_shortage_unmet)),
+        ]);
+    }
+
+    println!("{table}");
+    println!();
+    for s in summaries {
+        let money: Vec<String> = s.trader_money.iter().map(|m| format!("{m:.1}")).collect();
+        println!(
+            "  {} → trader money [{}], last trade month {}",
+            s.experiment,
+            money.join(", "),
+            if s.last_month_with_trade == 0 {
+                "never".to_string()
+            } else if s.last_month_with_trade < s.months {
+                s.last_month_with_trade.to_string()
+            } else {
+                "still active".to_string()
+            }
+        );
+    }
+    println!("(compare ran {months} months per variant)");
+}
+
+struct CliArgs {
+    experiment: Option<String>,
+    months: u32,
+    seed: u64,
+    quiet: bool,
+}
+
+fn parse_args() -> CliArgs {
+    let mut experiment = None;
+    let mut months = DEFAULT_MONTHS;
+    let mut seed = DEFAULT_SEED;
+    let mut quiet = false;
+
+    let mut args = env::args().skip(1);
+    while let Some(arg) = args.next() {
+        match arg.as_str() {
+            "--experiment" | "-e" => {
+                experiment = Some(args.next().expect("missing value for --experiment"));
+            }
+            "--months" | "-m" => {
+                months = args
+                    .next()
+                    .expect("missing value for --months")
+                    .parse()
+                    .expect("months must be a u32");
+            }
+            "--seed" => {
+                seed = args
+                    .next()
+                    .expect("missing value for --seed")
+                    .parse()
+                    .expect("seed must be a u64");
+            }
+            "--quiet" | "-q" => quiet = true,
+            "--compare" => experiment = Some("compare".to_string()),
+            "--help" | "-h" => {
+                println!(
+                    "Usage: mundios [OPTIONS]\n\
+                     \n\
+                     Default: full economy sim with imperfect prices ({DEFAULT_MONTHS} months)\n\
+                     \n\
+                     Options:\n\
+                       --months N, -m     Simulation length (default {DEFAULT_MONTHS})\n\
+                       --quiet, -q          Summary output only\n\
+                       --compare            Compare baseline vs stale-prices ({COMPARE_MONTHS} mo)\n\
+                       --experiment NAME    baseline | stale-prices\n\
+                       --seed N             RNG seed (default {DEFAULT_SEED})"
+                );
+                std::process::exit(0);
+            }
+            other if !other.starts_with('-') => {
+                experiment = Some(other.to_string());
+            }
+            _ => {}
+        }
+    }
+
+    CliArgs {
+        experiment,
+        months,
+        seed,
+        quiet,
+    }
+}
+
+fn main() {
+    let cli = parse_args();
+
+    if cli.experiment.as_deref() == Some("compare") {
+        let summaries: Vec<SimulationSummary> = ["baseline", "stale-prices"]
+            .iter()
+            .map(|name| {
+                run_simulation(SimulationConfig::named(
+                    name,
+                    cli.seed,
+                    COMPARE_MONTHS,
+                    false,
+                ))
+            })
+            .collect();
+        print_comparison_table(&summaries);
+        return;
+    }
+
+    if let Some(name) = cli.experiment {
+        let config = SimulationConfig::named(&name, cli.seed, cli.months, !cli.quiet);
+        let summary = run_simulation(config);
+        if cli.quiet {
+            println!(
+                "{}: shipments={} arrived={} shortages={} trade_months={}/{} last_trade={} trader_spread={:.1} min_settlement=${:.1}",
+                summary.experiment,
+                summary.shipments_created,
+                summary.shipments_arrived,
+                summary.shortages,
+                summary.months_with_trade,
+                summary.months,
+                summary.last_month_with_trade,
+                summary.trader_money_spread,
+                summary.min_settlement_money,
+            );
+        }
+        return;
+    }
+
+    let config = SimulationConfig::production(cli.months, cli.seed, !cli.quiet);
+    let mut world = create_demo_world(config);
+    let mut monthly_shipments = Vec::new();
+    let mut monthly_money: Vec<[f64; 3]> = Vec::new();
+
+    if !cli.quiet {
+        println!("{}", "Initial state:".bold().cyan());
+        print_settlements(&world.settlements);
+        println!();
+        print_traders(&world.traders, &world.settlements);
+        println!();
+    }
+
+    for _ in 0..cli.months {
+        world.tick_month();
+
+        let events: Vec<Event> = world.events.drain(..).collect();
+        let shipments = events
+            .iter()
+            .filter(|e| matches!(e, Event::ShipmentCreated { .. }))
+            .count();
+        monthly_shipments.push(shipments as u32);
+        monthly_money.push([
+            world.settlements[0].money,
+            world.settlements[1].money,
+            world.settlements[2].money,
+        ]);
+
+        if !cli.quiet {
+            println!(
+                "\n{}",
+                format!("═══ Month {} ═══", world.month).bold().cyan()
+            );
+            print_events(&events, &world);
+            println!();
+            print_settlements(&world.settlements);
+            println!();
+            print_traders(&world.traders, &world.settlements);
+        }
+    }
+
+    if cli.quiet || cli.months > 24 {
+        print_long_run_summary(cli.months, &monthly_shipments, &monthly_money, &world);
+    }
+}
+
+fn print_long_run_summary(months: u32, shipments: &[u32], money: &[[f64; 3]], world: &World) {
+    let names = ["Greenworld", "Ironmoon", "Forge Prime"];
+    let avg_shipments = shipments.iter().sum::<u32>() as f64 / months as f64;
+    let months_without_trade = shipments.iter().filter(|&&s| s == 0).count();
+
+    println!(
+        "\n{}",
+        format!("Long-run summary ({months} months)").bold().cyan()
+    );
+    println!("Avg shipments/month: {avg_shipments:.1}");
+    println!("Months without trade: {months_without_trade}/{months}");
+    println!();
+
+    for (i, name) in names.iter().enumerate() {
+        let values: Vec<f64> = money.iter().map(|m| m[i]).collect();
+        let min = values.iter().copied().reduce(f64::min).unwrap_or(0.0);
+        let max = values.iter().copied().reduce(f64::max).unwrap_or(0.0);
+        let final_m = world.settlements[i].money;
+        println!("  {name}: min ${min:.0}, max ${max:.0}, final ${final_m:.0}");
+    }
+
+    let trader_total: f64 = world.traders.iter().map(|t| t.money).sum();
+    println!("  Traders total: ${trader_total:.0}");
+    println!(
+        "  Total money: ${:.0} (conserved: ${:.0})",
+        total_money(world),
+        world.expected_total_money
+    );
+}
+
+fn create_demo_world(config: SimulationConfig) -> World {
     let base = base_prices();
 
     let farm_world = Settlement {
@@ -991,29 +1694,32 @@ fn create_demo_world() -> World {
         name: "Greenworld".to_string(),
         stockpiles: HashMap::from([(Good::Food, 500.0), (Good::Ore, 20.0), (Good::Tools, 30.0)]),
         prices: base.clone(),
-        production: HashMap::from([(Good::Food, 150.0)]),
+        production: HashMap::from([(Good::Food, 320.0)]),
         consumption: HashMap::from([(Good::Food, 80.0), (Good::Tools, 10.0)]),
-        money: 1000.0,
+        money: 1500.0,
+        production_scale: HashMap::new(),
     };
 
     let mining_world = Settlement {
         id: 1,
         name: "Ironmoon".to_string(),
-        stockpiles: HashMap::from([(Good::Food, 50.0), (Good::Ore, 300.0), (Good::Tools, 20.0)]),
+        stockpiles: HashMap::from([(Good::Food, 120.0), (Good::Ore, 200.0), (Good::Tools, 20.0)]),
         prices: base.clone(),
         production: HashMap::from([(Good::Ore, 120.0)]),
-        consumption: HashMap::from([(Good::Food, 120.0), (Good::Tools, 15.0)]),
-        money: 1000.0,
+        consumption: HashMap::from([(Good::Food, 100.0), (Good::Tools, 15.0)]),
+        money: 1500.0,
+        production_scale: HashMap::new(),
     };
 
     let factory_world = Settlement {
         id: 2,
         name: "Forge Prime".to_string(),
-        stockpiles: HashMap::from([(Good::Food, 100.0), (Good::Ore, 50.0), (Good::Tools, 100.0)]),
+        stockpiles: HashMap::from([(Good::Food, 120.0), (Good::Ore, 80.0), (Good::Tools, 80.0)]),
         prices: base.clone(),
-        production: HashMap::from([(Good::Tools, 60.0)]),
-        consumption: HashMap::from([(Good::Food, 140.0), (Good::Ore, 90.0)]),
-        money: 1000.0,
+        production: HashMap::from([(Good::Tools, 70.0)]),
+        consumption: HashMap::from([(Good::Food, 120.0), (Good::Ore, 90.0)]),
+        money: 1500.0,
+        production_scale: HashMap::new(),
     };
 
     let routes = vec![
@@ -1049,6 +1755,8 @@ fn create_demo_world() -> World {
         },
     ];
 
+    let settlements = vec![farm_world, mining_world, factory_world];
+
     let traders = vec![
         Trader {
             id: 0,
@@ -1057,7 +1765,8 @@ fn create_demo_world() -> World {
             home_base: 0,
             money: 1000.0,
             trade_capacity: 80.0,
-            risk_aversion: 2.0,
+            risk_tolerance: 0.55,
+            known_prices: HashMap::new(),
         },
         Trader {
             id: 1,
@@ -1066,21 +1775,25 @@ fn create_demo_world() -> World {
             home_base: 1,
             money: 1000.0,
             trade_capacity: 80.0,
-            risk_aversion: 0.5,
+            risk_tolerance: 0.75,
+            known_prices: HashMap::new(),
         },
     ];
-
-    let settlements = vec![farm_world, mining_world, factory_world];
 
     let mut world = World {
         month: 0,
         expected_total_money: 0.0,
+        config,
         settlements,
         routes,
         traders,
         shipments: Vec::new(),
         events: Vec::new(),
+        rng: StdRng::seed_from_u64(config.seed),
     };
+    if world.config.stale_prices {
+        world.refresh_trader_price_knowledge();
+    }
     world.expected_total_money = total_money(&world);
     world
 }
