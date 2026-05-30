@@ -14,6 +14,14 @@ const FAMILIARITY_FACTOR: f64 = 0.7;
 
 /// Monthly upkeep per unit of trade capacity, paid to home_base.
 const UPKEEP_PER_CAPACITY: f64 = 0.5;
+/// Crew, supplies, and services bought at the trader's current settlement.
+const LOCAL_SPEND_PER_CAPACITY: f64 = 0.5;
+/// Fraction of trader wealth spent locally each month (returns profits to settlements).
+const TRADER_REPATRIATION_RATE: f64 = 0.25;
+/// Settlements may borrow against near-term production while waiting for export revenue.
+const CREDIT_MONTHS_OF_PRODUCTION: f64 = 3.0;
+/// Traders cannot keep more than this fraction of import revenue as profit.
+const MAX_TRADER_MARGIN: f64 = 0.15;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 enum Good {
@@ -120,6 +128,11 @@ enum Event {
         home_base: SettlementId,
         amount: f64,
     },
+    LocalSpending {
+        trader: TraderId,
+        settlement: SettlementId,
+        amount: f64,
+    },
     ShipmentCreated {
         trader: TraderId,
         good: Good,
@@ -166,6 +179,7 @@ impl World {
         self.consume();
         self.update_prices();
         self.pay_trader_upkeep();
+        self.pay_trader_local_spending();
         self.create_trade_shipments();
         self.advance_shipments();
 
@@ -263,6 +277,28 @@ impl World {
         }
     }
 
+    fn pay_trader_local_spending(&mut self) {
+        for trader_id in 0..self.traders.len() {
+            let location = self.traders[trader_id].location;
+            let capacity_spend = self.traders[trader_id].trade_capacity * LOCAL_SPEND_PER_CAPACITY;
+            let wealth_spend = self.traders[trader_id].money * TRADER_REPATRIATION_RATE;
+            let payment = capacity_spend
+                .max(wealth_spend)
+                .min(self.traders[trader_id].money);
+
+            self.traders[trader_id].money -= payment;
+            self.settlements[location].money += payment;
+
+            if payment > 0.0 {
+                self.events.push(Event::LocalSpending {
+                    trader: trader_id,
+                    settlement: location,
+                    amount: payment,
+                });
+            }
+        }
+    }
+
     fn pay_trader_upkeep(&mut self) {
         for trader_id in 0..self.traders.len() {
             let upkeep = self.traders[trader_id].trade_capacity * UPKEEP_PER_CAPACITY;
@@ -306,10 +342,10 @@ impl World {
                     .copied()
                     .unwrap_or(0.0);
                 let trader_money = self.traders[trader_id].money;
-                let buyer_money = self.settlements[buyer_id].money;
+                let buyer_spending_power = settlement_purchasing_power(&self.settlements[buyer_id]);
 
                 let affordable_by_trader = trader_money / buy_price;
-                let affordable_by_buyer = buyer_money / buyer_price;
+                let affordable_by_buyer = buyer_spending_power / buyer_price;
                 let route_capacity_left = self.routes[opportunity.route].capacity_per_month
                     - self.routes[opportunity.route].used_capacity_this_month;
 
@@ -366,6 +402,10 @@ impl World {
                     seller: seller_id,
                     buyer: buyer_id,
                 });
+
+                if quantity < 5.0 {
+                    break;
+                }
             }
         }
     }
@@ -484,7 +524,10 @@ impl World {
             let transport_cost = shipment.quantity * shipment.transport_cost_per_unit;
             let transport_half = transport_cost / 2.0;
 
-            let profit = revenue - purchase_cost - transport_cost;
+            let raw_profit = revenue - purchase_cost - transport_cost;
+            let profit_cap = revenue * MAX_TRADER_MARGIN;
+            let profit = raw_profit.min(profit_cap);
+            let buyer_rebate = (raw_profit - profit).max(0.0);
 
             self.settlements[shipment.buyer]
                 .stockpiles
@@ -493,8 +536,8 @@ impl World {
                 .or_insert(shipment.quantity);
 
             self.settlements[shipment.buyer].money -= revenue;
-            self.traders[shipment.trader].money += revenue;
-            self.traders[shipment.trader].money -= transport_cost;
+            self.settlements[shipment.buyer].money += buyer_rebate;
+            self.traders[shipment.trader].money += revenue - transport_cost - buyer_rebate;
             self.settlements[route.a].money += transport_half;
             self.settlements[route.b].money += transport_half;
 
@@ -616,6 +659,24 @@ fn total_money(world: &World) -> f64 {
 
 fn base_prices() -> HashMap<Good, f64> {
     HashMap::from([(Good::Food, 10.0), (Good::Ore, 8.0), (Good::Tools, 20.0)])
+}
+
+fn monthly_production_value(settlement: &Settlement) -> f64 {
+    let base = base_prices();
+    settlement
+        .production
+        .iter()
+        .map(|(good, amount)| amount * base[good])
+        .sum()
+}
+
+fn credit_limit(settlement: &Settlement) -> f64 {
+    monthly_production_value(settlement) * CREDIT_MONTHS_OF_PRODUCTION
+}
+
+/// Cash on hand plus remaining borrowing capacity against future production.
+fn settlement_purchasing_power(settlement: &Settlement) -> f64 {
+    settlement.money + credit_limit(settlement)
 }
 
 fn percentage_change(old: f64, new: f64) -> f64 {
@@ -760,6 +821,23 @@ fn format_event(event: &Event, world: &World) -> EventRow {
                 "{} → {}",
                 world.traders[*trader].name,
                 settlement_name(*home_base)
+            ),
+            good: None,
+            details: format!("-{amount:.1}"),
+            details_color: Some(Color::Yellow),
+        },
+        Event::LocalSpending {
+            trader,
+            settlement,
+            amount,
+        } => EventRow {
+            kind: "LocalSpend",
+            kind_color: Color::Yellow,
+            kind_bold: false,
+            place: format!(
+                "{} → {}",
+                world.traders[*trader].name,
+                settlement_name(*settlement)
             ),
             good: None,
             details: format!("-{amount:.1}"),
@@ -991,29 +1069,29 @@ fn create_demo_world() -> World {
         name: "Greenworld".to_string(),
         stockpiles: HashMap::from([(Good::Food, 500.0), (Good::Ore, 20.0), (Good::Tools, 30.0)]),
         prices: base.clone(),
-        production: HashMap::from([(Good::Food, 150.0)]),
+        production: HashMap::from([(Good::Food, 320.0)]),
         consumption: HashMap::from([(Good::Food, 80.0), (Good::Tools, 10.0)]),
-        money: 1000.0,
+        money: 1500.0,
     };
 
     let mining_world = Settlement {
         id: 1,
         name: "Ironmoon".to_string(),
-        stockpiles: HashMap::from([(Good::Food, 50.0), (Good::Ore, 300.0), (Good::Tools, 20.0)]),
+        stockpiles: HashMap::from([(Good::Food, 120.0), (Good::Ore, 200.0), (Good::Tools, 20.0)]),
         prices: base.clone(),
         production: HashMap::from([(Good::Ore, 120.0)]),
-        consumption: HashMap::from([(Good::Food, 120.0), (Good::Tools, 15.0)]),
-        money: 1000.0,
+        consumption: HashMap::from([(Good::Food, 100.0), (Good::Tools, 15.0)]),
+        money: 1500.0,
     };
 
     let factory_world = Settlement {
         id: 2,
         name: "Forge Prime".to_string(),
-        stockpiles: HashMap::from([(Good::Food, 100.0), (Good::Ore, 50.0), (Good::Tools, 100.0)]),
+        stockpiles: HashMap::from([(Good::Food, 120.0), (Good::Ore, 80.0), (Good::Tools, 80.0)]),
         prices: base.clone(),
-        production: HashMap::from([(Good::Tools, 60.0)]),
-        consumption: HashMap::from([(Good::Food, 140.0), (Good::Ore, 90.0)]),
-        money: 1000.0,
+        production: HashMap::from([(Good::Tools, 70.0)]),
+        consumption: HashMap::from([(Good::Food, 120.0), (Good::Ore, 90.0)]),
+        money: 1500.0,
     };
 
     let routes = vec![
