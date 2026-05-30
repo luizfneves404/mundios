@@ -213,8 +213,7 @@ impl World {
         self.consume();
         self.update_prices();
         self.service_debt_interest();
-        self.pay_trader_upkeep();
-        self.pay_trader_local_spending();
+        self.pay_trader_expenses();
         self.create_trade_shipments();
         self.advance_shipments();
 
@@ -436,6 +435,15 @@ impl World {
         neighbors
     }
 
+    fn markets_heard_by(&self, location: SettlementId, home_base: SettlementId) -> Vec<SettlementId> {
+        let mut heard = vec![location, home_base];
+        heard.extend(self.route_neighbors(location));
+        heard.extend(self.route_neighbors(home_base));
+        heard.sort_unstable();
+        heard.dedup();
+        heard
+    }
+
     fn rumor_price(&self, trader_id: TraderId, settlement_id: SettlementId, good: Good) -> f64 {
         let actual = self.settlements[settlement_id].prices[&good];
         let good_idx = match good {
@@ -452,14 +460,7 @@ impl World {
         for trader_id in 0..self.traders.len() {
             let location = self.traders[trader_id].location;
             let home_base = self.traders[trader_id].home_base;
-
-            let mut heard_from = Vec::new();
-            heard_from.push(location);
-            heard_from.push(home_base);
-            heard_from.extend(self.route_neighbors(location));
-            heard_from.extend(self.route_neighbors(home_base));
-            heard_from.sort_unstable();
-            heard_from.dedup();
+            let heard_from = self.markets_heard_by(location, home_base);
 
             for settlement_id in heard_from {
                 for &good in &[Good::Food, Good::Ore, Good::Tools] {
@@ -485,20 +486,7 @@ impl World {
         }
     }
 
-    fn trader_price(&self, trader_id: TraderId, settlement_id: SettlementId, good: Good) -> f64 {
-        let trader = &self.traders[trader_id];
-        if settlement_id == trader.location || settlement_id == trader.home_base {
-            return self.settlements[settlement_id].prices[&good];
-        }
-
-        trader
-            .known_prices
-            .get(&(settlement_id, good))
-            .copied()
-            .unwrap_or(base_prices()[&good])
-    }
-
-    /// Stale quotes get a small directional bias: cautious traders expect worse prices abroad.
+    /// Fresh quotes at current location and home; rumors or memory elsewhere.
     fn trader_perceived_price(
         &self,
         trader_id: TraderId,
@@ -507,7 +495,15 @@ impl World {
     ) -> f64 {
         let trader = &self.traders[trader_id];
         let fresh = settlement_id == trader.location || settlement_id == trader.home_base;
-        let quote = self.trader_price(trader_id, settlement_id, good);
+        let quote = if fresh {
+            self.settlements[settlement_id].prices[&good]
+        } else {
+            trader
+                .known_prices
+                .get(&(settlement_id, good))
+                .copied()
+                .unwrap_or(base_prices()[&good])
+        };
         if fresh {
             return quote;
         }
@@ -515,41 +511,34 @@ impl World {
         quote * (1.0 + bias)
     }
 
-    fn pay_trader_local_spending(&mut self) {
+    fn pay_trader_expenses(&mut self) {
         for trader_id in 0..self.traders.len() {
             let location = self.traders[trader_id].location;
-            let capacity_spend = self.traders[trader_id].trade_capacity * LOCAL_SPEND_PER_CAPACITY;
-            let spendable = (self.traders[trader_id].money - TRADER_OPERATING_RESERVE).max(0.0);
-            let wealth_spend = spendable * TRADER_REPATRIATION_RATE;
-            let payment = capacity_spend.max(wealth_spend).min(spendable);
-
-            self.traders[trader_id].money -= payment;
-            self.settlements[location].money += payment;
-
-            if payment > 0.0 {
-                self.events.push(Event::LocalSpending {
-                    trader: trader_id,
-                    settlement: location,
-                    amount: payment,
-                });
-            }
-        }
-    }
-
-    fn pay_trader_upkeep(&mut self) {
-        for trader_id in 0..self.traders.len() {
-            let upkeep = self.traders[trader_id].trade_capacity * UPKEEP_PER_CAPACITY;
             let home_base = self.traders[trader_id].home_base;
-            let payment = upkeep.min(self.traders[trader_id].money);
 
-            self.traders[trader_id].money -= payment;
-            self.settlements[home_base].money += payment;
-
-            if payment > 0.0 {
+            let upkeep = self.traders[trader_id].trade_capacity * UPKEEP_PER_CAPACITY;
+            let upkeep_paid = upkeep.min(self.traders[trader_id].money);
+            self.traders[trader_id].money -= upkeep_paid;
+            self.settlements[home_base].money += upkeep_paid;
+            if upkeep_paid > 0.0 {
                 self.events.push(Event::UpkeepPaid {
                     trader: trader_id,
                     home_base,
-                    amount: payment,
+                    amount: upkeep_paid,
+                });
+            }
+
+            let capacity_spend = self.traders[trader_id].trade_capacity * LOCAL_SPEND_PER_CAPACITY;
+            let spendable = (self.traders[trader_id].money - TRADER_OPERATING_RESERVE).max(0.0);
+            let wealth_spend = spendable * TRADER_REPATRIATION_RATE;
+            let local_paid = capacity_spend.max(wealth_spend).min(spendable);
+            self.traders[trader_id].money -= local_paid;
+            self.settlements[location].money += local_paid;
+            if local_paid > 0.0 {
+                self.events.push(Event::LocalSpending {
+                    trader: trader_id,
+                    settlement: location,
+                    amount: local_paid,
                 });
             }
         }
@@ -652,7 +641,6 @@ impl World {
             let orientations = [(route.a, route.b), (route.b, route.a)];
 
             for &(seller_id, buyer_id) in &orientations {
-                let seller = &self.settlements[seller_id];
                 let buyer = &self.settlements[buyer_id];
                 let p_eff = effective_monthly_incident_rate(route, trader.location);
 
@@ -684,7 +672,10 @@ impl World {
                         continue;
                     }
 
-                    let stock = *seller.stockpiles.get(&good).unwrap_or(&0.0);
+                    let stock = *self.settlements[seller_id]
+                        .stockpiles
+                        .get(&good)
+                        .unwrap_or(&0.0);
                     let suggested_quantity = stock.min(shortage).min(max_capacity).floor();
 
                     if suggested_quantity < 1.0 {
@@ -1448,7 +1439,7 @@ fn create_demo_world() -> World {
 
     let settlements = vec![farm_world, mining_world, factory_world];
 
-    let mut traders = vec![
+    let traders = vec![
         Trader {
             id: 0,
             name: "Free Merchants".to_string(),
@@ -1471,17 +1462,6 @@ fn create_demo_world() -> World {
         },
     ];
 
-    for trader in &mut traders {
-        for settlement_id in 0..settlements.len() {
-            for &good in &[Good::Food, Good::Ore, Good::Tools] {
-                trader.known_prices.insert(
-                    (settlement_id, good),
-                    settlements[settlement_id].prices[&good],
-                );
-            }
-        }
-    }
-
     let mut world = World {
         month: 0,
         expected_total_money: 0.0,
@@ -1491,6 +1471,7 @@ fn create_demo_world() -> World {
         shipments: Vec::new(),
         events: Vec::new(),
     };
+    world.refresh_trader_price_knowledge();
     world.expected_total_money = total_money(&world);
     world
 }
